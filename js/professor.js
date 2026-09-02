@@ -205,35 +205,181 @@ async function viewEditor(main, code) {
       .map(([v, l]) => h("option", { value: v, selected: ex.violation_action === v }, l))),
     questions_per_student: h("input.input", { type: "number", min: 0, value: ex.questions_per_student || 0 }),
     allowed_domain: h("input.input", { value: ex.allowed_domain || "", placeholder: "e.g. perpetualdalta.edu.ph (blank = any)" }),
-    roster: h("textarea", { placeholder: "Optional: one student e-mail per line. Blank = anyone with the code." },
+    roster: h("textarea", { rows: 3, placeholder: "student1@school.edu\nstudent2@school.edu" },
       (ex.roster || []).join("\n")),
-    require_fullscreen: chk("Require fullscreen", ex.require_fullscreen),
-    block_clipboard: chk("Block copy / paste", ex.block_clipboard),
-    shuffle_questions: chk("Shuffle question order per student", ex.shuffle_questions),
-    shuffle_options: chk("Shuffle answer options per student", ex.shuffle_options),
-    one_at_a_time: chk("Show one question at a time", ex.one_at_a_time),
-    require_student_id: chk("Require student ID & section", ex.require_student_id),
-    show_correct_answers: chk("Show correct answers to students when scores are released", ex.show_correct_answers),
+    require_fullscreen: sw("Require fullscreen", "The paper opens fullscreen. Leaving it is recorded.", ex.require_fullscreen),
+    block_clipboard: sw("Block copy & paste", "Stops questions being pasted into a chat or search box.", ex.block_clipboard),
+    shuffle_questions: sw("Shuffle question order", "Each student gets the questions in a different order.", ex.shuffle_questions),
+    shuffle_options: sw("Shuffle answer options", "“B” is not the same choice on the screen next to them.", ex.shuffle_options),
+    one_at_a_time: sw("One question at a time", "Nobody can photograph the whole paper at once.", ex.one_at_a_time),
+    require_student_id: sw("Ask for student ID & section", "Collected once, before the timer starts.", ex.require_student_id),
+    show_correct_answers: sw("Reveal correct answers afterwards", "Only takes effect once you release the scores.", ex.show_correct_answers),
   };
-  function chk(label, val) {
-    const i = h("input", { type: "checkbox", checked: !!val });
-    const l = h("label.check", i, h("span", label));
-    l.input = i; return l;
+  /** A labelled toggle. `.input` is kept so save() can read it like the old checkbox. */
+  function sw(label, desc, val) {
+    const i = h("input", { type: "checkbox", checked: !!val, onchange: () => refreshSummary() });
+    const l = h("label.switch", i, h("div", h("div.s-label", label), h("div.s-desc", desc)));
+    l.input = i;
+    return l;
+  }
+  for (const k of ["duration_minutes", "max_violations", "questions_per_student", "allowed_domain"])
+    f[k].addEventListener("input", () => refreshSummary());
+  f.violation_action.addEventListener("change", () => refreshSummary());
+  f.roster.addEventListener("input", () => refreshSummary());
+
+  // --- Presets. Most professors want one of three postures, not seven decisions.
+  const PRESETS = [
+    { name: "Practice", desc: "Open book. Nothing locked down, answers shown after.",
+      set: { require_fullscreen: false, block_clipboard: false, shuffle_questions: false,
+             shuffle_options: false, one_at_a_time: false, show_correct_answers: true },
+      max_violations: 20, violation_action: "warn" },
+    { name: "Standard quiz", desc: "Shuffled, fullscreen, copy blocked. A few slips forgiven.",
+      set: { require_fullscreen: true, block_clipboard: true, shuffle_questions: true,
+             shuffle_options: true, one_at_a_time: false, show_correct_answers: false },
+      max_violations: 5, violation_action: "lock" },
+    { name: "Strict proctored", desc: "One question at a time, short leash — two slips locks it.",
+      set: { require_fullscreen: true, block_clipboard: true, shuffle_questions: true,
+             shuffle_options: true, one_at_a_time: true, show_correct_answers: false },
+      max_violations: 2, violation_action: "lock" },
+  ];
+  const presetBtns = PRESETS.map((p) => h("button.preset", { type: "button",
+    onclick: () => {
+      for (const [k, v] of Object.entries(p.set)) f[k].input.checked = v;
+      f.max_violations.value = p.max_violations;
+      f.violation_action.value = p.violation_action;
+      refreshSummary();
+      toast(`Applied the “${p.name}” preset. You can still change anything below.`, "success");
+    } }, h("span.p-name", p.name), h("span.p-desc", p.desc)));
+  const matchesPreset = (p) =>
+    Object.entries(p.set).every(([k, v]) => f[k].input.checked === v) &&
+    Number(f.max_violations.value) === p.max_violations &&
+    f.violation_action.value === p.violation_action;
+
+  // --- The one line that says what the exam actually does, plus a note on each
+  //     collapsed group so nothing important hides behind a closed arrow.
+  const summary = h("div.summary-line");
+  const note = { timing: h("span.g-note"), proctor: h("span.g-note"),
+                 delivery: h("span.g-note"), access: h("span.g-note"), after: h("span.g-note") };
+  const ACTION_WORD = { lock: "lock the exam", submit: "auto-submit", warn: "warn only" };
+
+  function refreshSummary() {
+    presetBtns.forEach((b, i) => b.setAttribute("aria-pressed", String(matchesPreset(PRESETS[i]))));
+    const on = (k) => f[k].input.checked;
+    const mins = Math.max(1, parseInt(f.duration_minutes.value) || 0);
+    const per = Math.max(0, parseInt(f.questions_per_student.value) || 0);
+    const lim = Math.max(1, parseInt(f.max_violations.value) || 1);
+    const act = ACTION_WORD[f.violation_action.value] || f.violation_action.value;
+    const rosterCount = f.roster.value.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean).length;
+    const domain = f.allowed_domain.value.trim().replace(/^@/, "");
+
+    clear(summary);
+    const bits = [
+      [String(mins), " min"],
+      [String(per || questions.length), per ? ` of ${questions.length} questions each` : " questions"],
+      [null, on("require_fullscreen") ? "fullscreen" : "windowed"],
+      [null, on("shuffle_questions") || on("shuffle_options") ? "shuffled" : "fixed order"],
+      [String(lim), ` violations → ${act}`],
+    ];
+    bits.forEach(([b, rest], i) => {
+      if (i) summary.append(h("span.sep", "•"));
+      summary.append(b ? h("span", h("b", b), rest) : h("span", rest));
+    });
+
+    note.timing.textContent = `${mins} min · ${lim} violations → ${act}`;
+    const pc = ["require_fullscreen", "block_clipboard"].filter(on).length;
+    note.proctor.textContent = pc === 2 ? "fullscreen + clipboard locked"
+      : pc === 1 ? (on("require_fullscreen") ? "fullscreen only" : "clipboard only") : "off";
+    const dbits = [on("shuffle_questions") && "questions shuffled", on("shuffle_options") && "options shuffled",
+                   on("one_at_a_time") && "one at a time", per && `${per} per student`].filter(Boolean);
+    note.delivery.textContent = dbits.length ? dbits.join(", ") : "everyone gets the same paper";
+    note.access.textContent = rosterCount ? `${rosterCount} on the roster`
+      : domain ? `anyone @${domain}` : "anyone with the code";
+    note.after.textContent = on("show_correct_answers") ? "answers revealed on release" : "scores only";
   }
 
   const qHost = h("div#qHost");
-  const stats = h("span.muted.small");
+  const stats = h("span.small");
+  const qFilter = h("input.input", { placeholder: "Search questions…", oninput: () => render() });
   const newQid = () => `new_${randomId(8)}`;
+  let openQid = null;                       // only one question is expanded at a time
 
+  const TYPE_CHIP = { mc: "Choice", multi: "Multi", tf: "T / F", text: "Short", essay: "Essay" };
+  const isIncomplete = (q, i) => validateQuestion(q, i).length > 0 || validateKey(q, q.key, i).length > 0;
+
+  function updateStats() {
+    const bad = questions.filter(isIncomplete).length;
+    clear(stats);
+    stats.append(h("span.muted", `${questions.length} questions · ${paperMaxPoints(questions)} points`));
+    if (bad) stats.append(h("span", { style: { color: "var(--warn)", fontWeight: "600" } }, ` · ${bad} unfinished`));
+  }
+
+  // A 60-question exam used to render 60 open editors at once. Now each question
+  // is one line, and exactly one opens at a time.
   const render = () => {
     clear(qHost);
-    questions.forEach((q, i) => qHost.append(qEditor(q, i)));
-    stats.textContent = `${questions.length} questions · ${paperMaxPoints(questions)} points`;
+    const term = qFilter.value.trim().toLowerCase();
+    const list = h("div.q-list");
+    let shown = 0;
+    questions.forEach((q, i) => {
+      if (term && !(q.prompt || "").toLowerCase().includes(term)) return;
+      shown++;
+      list.append(qRow(q, i));
+      if (q.id === openQid) list.append(h("div.q-body", qEditor(q, i)));
+    });
+    if (!shown) list.append(h("div.q-empty", questions.length
+      ? `No question mentions “${qFilter.value.trim()}”.`
+      : "No questions yet. Add one below, or import a file you already have."));
+    qHost.append(list);
+    updateStats();
+    refreshSummary();
   };
+
+  function qRow(q, i) {
+    const open = q.id === openQid;
+    const act = (title, glyph, fn, style) => h("button.btn.btn-sm.btn-ghost",
+      { type: "button", title, style, onclick: (e) => { e.stopPropagation(); fn(); } }, glyph);
+    const text = (q.prompt || "").trim();
+    return h("div.q-row" + (open ? ".open" : ""), {
+        dataset: { qid: q.id }, title: open ? "Click to collapse" : "Click to edit",
+        onclick: () => { openQid = open ? null : q.id; render(); } },
+      h("span.q-idx", `${i + 1}.`),
+      h("span.type-chip", TYPE_CHIP[q.type] || q.type),
+      h("span.q-text" + (text ? "" : ".blank"), text || "Untitled question"),
+      h("span.q-meta",
+        h("span.q-flag" + (isIncomplete(q, i) ? ".warn" : ""),
+          { title: isIncomplete(q, i) ? "Missing a prompt, an option or an answer key" : "Ready" }),
+        h("span.q-pts", `${q.points ?? 1} pt`)),
+      h("span.q-actions",
+        act("Move up", "↑", () => {
+          if (i > 0) { [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]]; render(); } }),
+        act("Move down", "↓", () => {
+          if (i < questions.length - 1) { [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]]; render(); } }),
+        act("Duplicate", "⧉", () => {
+          questions.splice(i + 1, 0, { ...q, id: newQid(), options: q.options?.slice(),
+            key: JSON.parse(JSON.stringify(q.key || {})) });
+          render(); }),
+        act("Delete", "✕", () => {
+          questions.splice(i, 1); if (openQid === q.id) openQid = null; render(); },
+          { color: "var(--danger)" })));
+  }
 
   function qEditor(q, i) {
     const k = q.key || (q.key = {});
-    const box = h("div.q-editor", { dataset: { qid: q.id } });
+    const box = h("div", { dataset: { qid: q.id } });
+
+    // Keep the collapsed row in step while typing, without re-rendering the
+    // list (which would steal focus mid-word).
+    const syncRow = () => {
+      const r = qHost.querySelector(`.q-row[data-qid="${q.id}"]`);
+      if (!r) return;
+      const t = r.querySelector(".q-text"), txt = (q.prompt || "").trim();
+      t.textContent = txt || "Untitled question";
+      t.classList.toggle("blank", !txt);
+      r.querySelector(".q-pts").textContent = `${q.points ?? 1} pt`;
+      r.querySelector(".q-flag").classList.toggle("warn", isIncomplete(q, i));
+      updateStats();
+    };
+
     const typeSel = h("select", Object.entries(QUESTION_TYPES)
       .map(([v, l]) => h("option", { value: v, selected: q.type === v }, l)));
     typeSel.style.maxWidth = "260px";
@@ -243,26 +389,22 @@ async function viewEditor(main, code) {
       q.key = q.type === "tf" ? { correct: true } : {};
       render();
     };
-    const prompt = h("textarea", { rows: 2, placeholder: "Question text",
-      oninput: (e) => (q.prompt = e.target.value) }, q.prompt || "");
+    const prompt = h("textarea", { rows: 3, placeholder: "Question text",
+      oninput: (e) => { q.prompt = e.target.value; syncRow(); } }, q.prompt || "");
     const pts = h("input.input", { type: "number", min: .5, step: .5, value: q.points ?? 1,
-      style: { width: "80px" }, oninput: (e) => (q.points = Number(e.target.value)) });
+      style: { width: "80px" }, oninput: (e) => { q.points = Number(e.target.value); syncRow(); } });
 
-    box.append(h("div.row.between", { style: { marginBottom: ".5rem" } },
-      h("div.row", h("strong", `Q${i + 1}`), typeSel, h("label.small.muted", "pts ", pts)),
-      h("div.row",
-        h("button.btn.btn-sm.btn-ghost", { title: "Move up", onclick: () => {
-          if (i > 0) { [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]]; render(); } } }, "↑"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Move down", onclick: () => {
-          if (i < questions.length - 1) { [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]]; render(); } } }, "↓"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Duplicate", onclick: () => {
-          questions.splice(i + 1, 0, { ...q, id: newQid(), options: q.options?.slice(), key: JSON.parse(JSON.stringify(k)) });
-          render(); } }, "⧉"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Delete", style: { color: "var(--danger)" },
-          onclick: () => { questions.splice(i, 1); render(); } }, "✕"),
-      )), prompt);
+    box.append(
+      h("div.row", { style: { marginBottom: ".6rem" } },
+        h("label.field", { style: { flex: "1", minWidth: "180px", maxWidth: "280px" } },
+          h("span", "Question type"), typeSel),
+        h("label.field", { style: { width: "90px" } }, h("span", "Points"), pts),
+        h("div.spacer"),
+        h("button.btn.btn-sm", { type: "button", title: "Collapse this question",
+          onclick: () => { openQid = null; render(); } }, "Done")),
+      h("label.field", h("span", "Question text"), prompt));
 
-    const body = h("div", { style: { marginTop: ".5rem" } });
+    const body = h("div", { style: { marginTop: ".8rem" } });
     if (q.type === "mc" || q.type === "multi") {
       q.options = q.options || ["", ""];
       const rows = h("div");
@@ -433,7 +575,7 @@ async function viewEditor(main, code) {
       answers: Object.fromEntries(questions.map((q, i) => [`q${i + 1}`, q.key || {}])),
     }, null, 2), "application/json");
 
-  main.append(
+  main.append(...[
     h("div.card-head", h("h1", ex.code ? "Edit exam" : "New exam"),
       h("div.row", ex.code ? h("span.pill-code", ex.code) : null, statusBadge(ex.status))),
     sessionCount && ex.status !== "draft"
@@ -452,26 +594,64 @@ async function viewEditor(main, code) {
         h("label.field", h("span", "Closes at (hard cut-off)"), f.closes_at),
         h("label.field", h("span", "Professor name shown"), f.owner_name)),
     ),
-    h("div.card", h("h3", "Timing & anti-cheat"),
-      h("div.grid.grid-3",
-        h("label.field", h("span", "Duration (minutes)"), f.duration_minutes),
-        h("label.field", h("span", "Violation limit"), f.max_violations),
-        h("label.field", h("span", "When the limit is reached"), f.violation_action)),
-      h("div.grid.grid-2", { style: { marginTop: ".8rem" } },
-        f.require_fullscreen, f.block_clipboard, f.shuffle_questions, f.shuffle_options,
-        f.one_at_a_time, f.require_student_id, f.show_correct_answers),
-      h("div.grid.grid-3", { style: { marginTop: ".8rem" } },
-        h("label.field", h("span", "Questions per student (0 = all)"), f.questions_per_student,
-          h("span.help", "Random subset per student, drawn from the pool below.")),
-        h("label.field", h("span", "Restrict to e-mail domain"), f.allowed_domain),
-        h("label.field", h("span", "Roster (allowed e-mails)"), f.roster)),
+    h("div.card",
+      h("h3", "How the exam runs"),
+      h("p.help", { style: { marginTop: 0 } },
+        "Start from a preset, then open only the group you want to change. " +
+        "Everything here can be edited later, even after students have started."),
+      h("div.preset-row", presetBtns),
+      h("div", { style: { marginTop: ".9rem", marginBottom: ".2rem" } }, summary),
+
+      h("details.group", { open: true },
+        h("summary", "Time limit & violations", note.timing),
+        h("div.group-body",
+          h("div.grid.grid-3", { style: { marginTop: ".8rem" } },
+            h("label.field", h("span", "Duration (minutes)"), f.duration_minutes,
+              h("span.help", "Counted from the moment a student starts, not from the open time.")),
+            h("label.field", h("span", "Violation limit"), f.max_violations,
+              h("span.help", "Tab switches, exiting fullscreen, paste attempts.")),
+            h("label.field", h("span", "When the limit is reached"), f.violation_action)))),
+
+      h("details.group",
+        h("summary", "Lockdown while writing", note.proctor),
+        h("div.group-body", f.require_fullscreen, f.block_clipboard,
+          h("p.help", "These are deterrents that get logged, not a guarantee. " +
+            "The monitor tab shows you every slip as it happens."))),
+
+      h("details.group",
+        h("summary", "How the paper is dealt out", note.delivery),
+        h("div.group-body", f.shuffle_questions, f.shuffle_options, f.one_at_a_time,
+          h("label.field", { style: { marginTop: ".8rem", maxWidth: "320px" } },
+            h("span", "Questions per student"), f.questions_per_student,
+            h("span.help", "0 gives everyone the whole set. Any other number draws that many at random from the pool below.")))),
+
+      h("details.group",
+        h("summary", "Who is allowed in", note.access),
+        h("div.group-body",
+          f.require_student_id,
+          h("div.grid.grid-2", { style: { marginTop: ".8rem" } },
+            h("label.field", h("span", "Restrict to e-mail domain"), f.allowed_domain,
+              h("span.help", "Blank lets any signed-in account in.")),
+            h("label.field", h("span", "Roster"), f.roster,
+              h("span.help", "One e-mail per line. Blank lets anyone with the code in."))))),
+
+      h("details.group",
+        h("summary", "After the exam", note.after),
+        h("div.group-body", f.show_correct_answers,
+          h("p.help", "Scores stay hidden until you release them from the Grades tab, " +
+            "whatever this is set to."))),
     ),
     h("div.card",
       h("div.card-head", h("div", h("h3", "Questions"), stats),
         h("div.row", h("button.btn.btn-sm", { onclick: importDialog }, "⬆ Import"),
           h("button.btn.btn-sm", { onclick: exportJson }, "⬇ Export JSON"))),
+      h("div.q-toolbar", qFilter,
+        h("span.small.muted", "Click a row to edit it."),
+        h("div.spacer"),
+        h("button.btn.btn-sm", { type: "button", title: "Collapse the open question",
+          onclick: () => { openQid = null; render(); } }, "Collapse all")),
       qHost,
-      h("div.row", { style: { marginTop: ".8rem" } }, h("span.small.muted", "Add:"),
+      h("div.add-menu", { style: { marginTop: ".8rem" } }, h("span.small.muted", "Add:"),
         ...Object.entries(QUESTION_TYPES).map(([v, l]) =>
           h("button.btn.btn-sm", { onclick: () => addQ(v) }, "+ " + l.split(" (")[0]))),
     ),
@@ -487,7 +667,7 @@ async function viewEditor(main, code) {
       h("div.spacer"),
       ex.code ? h("button.btn.btn-sm.btn-danger", { onclick: () => removeExam(ex.code) }, "🗑 Delete exam") : null,
     )),
-  );
+  ].filter(Boolean));
   render();
 }
 

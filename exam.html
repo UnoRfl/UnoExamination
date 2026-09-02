@@ -32,7 +32,11 @@
       showBootError(why);
     }, 10000);
     function showBootError(detail) {
+      // Never speak over content the app already drew: if the placeholder is
+      // gone, the page rendered something and this watchdog has no business
+      // replacing it.
       if (window.__unoRendered || document.getElementById("bootError")) return;
+      if (!document.getElementById("bootPlaceholder")) return;
       var host = document.getElementById("app") || document.body;
       var errs = (window.__unoErrors || []).slice(0, 3).join(" | ");
       var d = document.createElement("div");
@@ -56,7 +60,7 @@
   </script>
 </head>
 <body>
-<div id="app"><div class="container narrow"><div class="card center"><p class="muted">Loading exam…</p></div></div></div>
+<div id="app"><div class="container narrow"><div class="card center" id="bootPlaceholder"><p class="muted">Loading exam…</p></div></div></div>
 <script type="module" src="js/student.js"></script>
 </body>
 </html>

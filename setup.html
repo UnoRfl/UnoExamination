@@ -44,7 +44,11 @@
       showBootError(why);
     }, 10000);
     function showBootError(detail) {
+      // Never speak over content the app already drew: if the placeholder is
+      // gone, the page rendered something and this watchdog has no business
+      // replacing it.
       if (window.__unoRendered || document.getElementById("bootError")) return;
+      if (!document.getElementById("bootPlaceholder")) return;
       var host = document.getElementById("app") || document.body;
       var errs = (window.__unoErrors || []).slice(0, 3).join(" | ");
       var d = document.createElement("div");
@@ -80,7 +84,7 @@
       missing. Open it after pasting your config and deploying the rules. It is safe to leave
       deployed, but you can delete <code>setup.html</code> and <code>js/setup.js</code> once
       everything passes.</p>
-    <div id="checks"></div>
+    <div id="checks"><div id="bootPlaceholder" class="muted">Loading…</div></div>
     <div class="row" style="margin-top:1rem">
       <button class="btn btn-primary" id="rerun">Run checks again</button>
       <div id="authActions" class="row"></div>

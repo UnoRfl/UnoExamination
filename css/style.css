@@ -171,9 +171,8 @@ body.proctored .q-card, body.proctored .exam-head { user-select: none; -webkit-u
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: .9rem 1rem; }
 .stat .n { font-size: 1.6rem; font-weight: 800; } .stat .l { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .exam-tile { cursor: pointer; transition: transform .1s; } .exam-tile:hover { transform: translateY(-2px); }
-.q-editor { border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; background: var(--surface-2); margin-bottom: .8rem; }
-.q-editor .opt-row { display: flex; gap: .5rem; align-items: center; margin-bottom: .4rem; }
-.q-editor .opt-row .input { flex: 1; }
+.opt-row { display: flex; gap: .5rem; align-items: center; margin-bottom: .4rem; }
+.opt-row .input { flex: 1; }
 .drawer { position: fixed; top: 0; right: 0; height: 100vh; width: min(720px, 100vw); background: var(--surface); border-left: 1px solid var(--border); box-shadow: -10px 0 40px rgba(0,0,0,.25); z-index: 7000; overflow: auto; padding: 1.3rem; }
 .timeline { list-style: none; padding: 0; margin: 0; font-size: .85rem; }
 .timeline li { display: grid; grid-template-columns: 90px 1fr; gap: .6rem; padding: .3rem 0; border-bottom: 1px dashed var(--border); }
@@ -190,3 +189,99 @@ body.proctored .q-card, body.proctored .exam-head { user-select: none; -webkit-u
 kbd { font-family: var(--mono); font-size: .8em; background: var(--surface-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 0 .35em; }
 .empty { text-align: center; color: var(--muted); padding: 2rem; }
 @media print { body * { display: none !important; } }
+
+/* ===== Exam editor: settings ============================================ */
+/* The old editor put seven checkboxes and six fields in one flat card. These
+   styles support presets + collapsible groups so a professor sees a short
+   summary and opens only the group they care about. */
+.preset-row { display: flex; gap: .6rem; flex-wrap: wrap; }
+.preset {
+  flex: 1 1 200px; text-align: left; padding: .8rem .9rem; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface); cursor: pointer;
+  font: inherit; color: var(--text); transition: border-color .12s, background .12s;
+}
+.preset:hover { border-color: var(--primary); background: var(--surface-2); }
+.preset[aria-pressed="true"] { border-color: var(--primary); background: var(--primary-soft); box-shadow: inset 0 0 0 1px var(--primary); }
+.preset .p-name { font-weight: 700; display: block; }
+.preset .p-desc { font-size: .8rem; color: var(--muted); display: block; margin-top: .15rem; }
+
+.summary-line {
+  display: flex; flex-wrap: wrap; gap: .4rem .7rem; align-items: center;
+  padding: .7rem .9rem; border-radius: 10px; background: var(--surface-2);
+  border: 1px solid var(--border); font-size: .88rem;
+}
+.summary-line b { font-weight: 700; }
+.summary-line .sep { color: var(--border); }
+
+details.group {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+  margin-top: .7rem; overflow: hidden;
+}
+details.group > summary {
+  cursor: pointer; padding: .75rem .9rem; font-weight: 600; list-style: none;
+  display: flex; align-items: center; gap: .6rem; user-select: none;
+}
+details.group > summary::-webkit-details-marker { display: none; }
+details.group > summary::before {
+  content: "▸"; color: var(--muted); transition: transform .15s; display: inline-block;
+}
+details.group[open] > summary::before { transform: rotate(90deg); }
+details.group > summary:hover { background: var(--surface-2); }
+details.group > summary .g-note { margin-left: auto; font-weight: 400; font-size: .82rem; color: var(--muted); }
+details.group .group-body { padding: 0 .9rem 1rem; border-top: 1px solid var(--border); }
+
+/* A switch reads faster than a bare checkbox and leaves room to explain itself */
+.switch { display: grid; grid-template-columns: 44px 1fr; gap: .75rem; align-items: start; padding: .7rem 0; border-bottom: 1px solid var(--border); }
+.switch:last-child { border-bottom: 0; }
+.switch input { appearance: none; width: 44px; height: 24px; border-radius: 999px; background: var(--border); position: relative; cursor: pointer; transition: background .15s; margin: 0; flex: none; }
+.switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.switch input:checked { background: var(--primary); }
+.switch input:checked::after { transform: translateX(20px); }
+.switch input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch .s-label { font-weight: 600; cursor: pointer; }
+.switch .s-desc { font-size: .82rem; color: var(--muted); margin-top: .1rem; }
+
+/* ===== Exam editor: question list ======================================= */
+/* Questions collapse to one row each. A 60-item exam was 60 open editors. */
+.q-toolbar { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-bottom: .7rem; }
+.q-toolbar .input { max-width: 260px; }
+.q-list { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.q-row {
+  display: grid; grid-template-columns: 2.4rem 4.9rem 1fr 4.4rem 7.2rem; gap: .7rem;
+  align-items: center; padding: .6rem .8rem; border-bottom: 1px solid var(--border);
+  cursor: pointer; background: var(--surface);
+}
+.q-row:last-child { border-bottom: 0; }
+.q-row:hover { background: var(--surface-2); }
+.q-row.open { background: var(--primary-soft); }
+.q-row .q-idx { color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.q-row .q-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-row .q-text.blank { color: var(--muted); font-style: italic; }
+.q-row .q-pts { color: var(--muted); font-size: .82rem; white-space: nowrap; }
+.q-row .type-chip { justify-self: start; }
+.q-row .q-meta { justify-self: end; }
+.q-row .q-actions { justify-self: end; }
+.type-chip {
+  font-size: .7rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: .12rem .45rem; border-radius: 5px; background: var(--surface-2);
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+.q-flag { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: none; }
+.q-flag.warn { background: var(--warn); }
+.q-body { padding: .9rem 1rem 1.1rem; background: var(--surface-2); border-bottom: 1px solid var(--border); }
+.q-actions { display: flex; gap: .15rem; }
+.q-actions .btn { padding: .2rem .45rem; font-size: .8rem; }
+.q-empty { padding: 2rem; text-align: center; color: var(--muted); }
+.add-menu { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
+
+/* the collapsed row's right-hand cluster: readiness dot + points */
+.q-row .q-meta { display: flex; gap: .45rem; align-items: center; }
+.q-body .field span:first-child { font-size: .82rem; }
+.q-body > div:first-child { align-items: flex-end; }
+@media (max-width: 640px) {
+  .q-row { grid-template-columns: 1.8rem 1fr auto; row-gap: .3rem; }
+  .q-row .type-chip { grid-row: 2; }
+  .q-row .q-meta { grid-row: 2; grid-column: 3; }
+  .q-row .q-actions { grid-row: 1; grid-column: 3; }
+  .q-row .q-text { grid-column: 2 / 4; }
+}

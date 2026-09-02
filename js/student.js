@@ -30,6 +30,7 @@ const S = {
 };
 
 if (!CODE) {
+  window.__unoRendered = true;
   app.innerHTML = `<div class="container narrow"><div class="card"><h2>No exam code</h2>
     <p>Go back to the <a href="./">home page</a> and enter your exam code.</p></div></div>`;
 } else {
@@ -229,13 +230,64 @@ async function begin(name, studentNo, section, mode) {
            { reload: reloaded, client: clientFingerprint() });
   if (reloaded && mode === "resume") logEvent(sessionId, "page_reload", {});
 
+  const recovered = restoreDraft();
+
   renderExam();
+  if (recovered) {
+    toast(`Recovered ${recovered} answer${recovered === 1 ? "" : "s"} saved on this device but not yet sent.`,
+      "warn", 8000);
+    S.dirty = true;
+    flush();
+    logEvent(sessionId, "draft_recovered", { count: recovered });
+  }
   startHeartbeat();
   listenSession();
   S.tickTimer = setInterval(tick, 500);
   tick();
 
   if (openedElsewhere) onViolation("multiple_tabs");
+}
+
+// ---------------------------------------------------------------- local copy
+// Answers live in memory until an autosave lands. On campus wifi that gap is
+// where work gets lost: connection drops, the student closes the tab, and
+// whatever had not reached the server is gone. Mirror every keystroke into
+// localStorage and replay it on the next load.
+const draftKey = () => `uno_draft_${S.session?.id}`;
+
+function saveDraft() {
+  try {
+    localStorage.setItem(draftKey(), JSON.stringify({
+      answers: S.answers, at: Date.now(), savedToServer: !S.dirty,
+    }));
+  } catch { /* private mode or quota: the server copy is still the real one */ }
+}
+
+function readDraft() {
+  try {
+    const raw = localStorage.getItem(draftKey());
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+const clearDraft = () => { try { localStorage.removeItem(draftKey()); } catch {} };
+
+/**
+ * Merge a local draft that never reached the server. The server copy wins for
+ * any question it already knows about; the draft only fills in what is missing,
+ * so a stale draft can never overwrite a newer saved answer.
+ */
+function restoreDraft() {
+  const d = readDraft();
+  if (!d || d.savedToServer) return 0;
+  let recovered = 0;
+  for (const [qid, val] of Object.entries(d.answers || {})) {
+    if (S.answers[qid] === undefined && val !== "" && val != null) {
+      S.answers[qid] = val;
+      recovered++;
+    }
+  }
+  return recovered;
 }
 
 const serverNow = () => Date.now() + S.clockOffset;
@@ -349,6 +401,7 @@ function setAnswer(qid, v) {
   if (S.ended) return;
   if (v === "" || v == null) delete S.answers[qid]; else S.answers[qid] = v;
   S.dirty = true;
+  saveDraft();
   updateNav();
   setSaveState("saving");
   clearTimeout(S.saveTimer);
@@ -382,6 +435,7 @@ async function flush() {
   try {
     await saveAnswers(S.session.id, S.answers, answeredCount(), S.paper.length);
     setSaveState(S.dirty ? "saving" : "saved");
+    saveDraft();
     S.lastHb = Date.now();
   } catch (e) {
     S.dirty = true;
@@ -534,6 +588,7 @@ async function submit(reason) {
       return setTimeout(() => submit(reason), 3000);
     }
   }
+  clearDraft();
   endLocal();
   renderDone(reason);
 }

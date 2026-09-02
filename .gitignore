@@ -11,3 +11,4 @@ ui-debug.log
 # dashboard instead, where the key lives in Firestore readable only by you.
 examples/*-answers.json
 examples/real-*.json
+tests/smoke/out/

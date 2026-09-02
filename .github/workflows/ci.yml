@@ -1,8 +1,10 @@
 name: CI
+
 on:
   push:
     branches: ["**"]
   pull_request:
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,16 +14,34 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 21
       - run: npm ci
-      - name: Unit tests (grading, shuffling, import)
+
+      - name: Unit tests (risk model, importer, validation)
         run: npm test
-      - name: Firestore security-rules tests (emulator)
-        run: npm run test:rules
-      - name: Install Chromium for the browser test
+
+      # The bug that shipped three times in a row was a page that loaded no
+      # JavaScript, or hung, and said nothing. A real browser catches that; a
+      # Node test cannot. This needs no secrets: it serves the site locally,
+      # stubs the Supabase API, and only asserts the pages actually render.
+      - name: Install Chromium
         run: npx playwright install --with-deps chromium
-      - name: End-to-end browser test (emulator)
+
+      - name: Browser smoke test (every page must render)
+        run: npm run test:smoke
+
+      # The full lifecycle against the real project only runs where the
+      # service-role key is available (pushes to this repo, not forks).
+      - name: End-to-end API test
+        if: ${{ env.SUPABASE_SERVICE_KEY != '' }}
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: npm run test:e2e
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-screenshots
+          path: tests/smoke/out/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -22,6 +22,7 @@ export const EVENT_WEIGHTS = {
   multiple_tabs: 10,
   multiple_displays: 2,
   page_reload: 2,
+  draft_recovered: 2,
   heartbeat_gap: 5,
   clock_skew: 1,
   resize: 0.5,
