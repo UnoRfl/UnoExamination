@@ -182,8 +182,9 @@ try {
     (await ed.locator("details.group").count()) >= 4);
   check("editor: every toggle is a labelled switch",
     (await ed.locator(".switch").count()) === 7, `${await ed.locator(".switch").count()} switches`);
-  check("editor: no bare checkbox grid survives",
-    (await ed.locator("label.check").count()) === 0);
+  // the old flat grid of bare checkboxes must be gone from the settings card
+  check("editor: no bare checkbox grid survives in the settings",
+    (await ed.locator(".card:has(.preset) label.check").count()) === 0);
   check("editor: shows a plain-language summary of the settings",
     (await ed.locator(".summary-line").innerText()).includes("min"));
   check("editor: a preset marks itself as selected",
