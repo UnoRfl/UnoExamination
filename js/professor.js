@@ -1,64 +1,84 @@
-// Professor dashboard: exam builder, live proctoring monitor, grading, access.
+// Professor dashboard: exam builder, live monitor, grading, access.
 //
-// Grading happens HERE, in the professor's (authenticated) browser: only the
-// exam owner can read the answer key, so students never receive it.
+// Grading is a database function now, so this page never downloads an answer
+// key to compute a score — it asks the server and shows the result.
+import { siteConfig } from "./config.js";
+import { watchAuth, renderAuthPanel, logout } from "./auth.js";
 import {
-  db, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, collection, query, where, orderBy,
-  onSnapshot, writeBatch, serverTimestamp, Timestamp,
-} from "./firebase-init.js";
-import { siteConfig } from "./firebase-config.js";
-import { watchAuth, ensureProfile, renderAuthPanel, logout } from "./auth.js";
-import { buildPaper, paperMaxPoints, QUESTION_TYPES, validateQuestion, validateKey } from "./paper.js";
-import { gradeSession, riskScore, importQuestions, EVENT_WEIGHTS } from "./grading.js";
+  myProfile, claimProfessor, setRoleByEmail, listProfessors,
+  myExams, getExam, saveExam, deleteExam,
+  examQuestions, examQuestionsWithKeys, replaceQuestions,
+  examSessions, sessionEvents, profUpdateSession, resetSession, getPaper,
+  gradeExam, gradeSession, setOverride, setFeedback, examGrades, releaseScores,
+  watchExamSessions, watchExamGrades,
+} from "./db.js";
+import { QUESTION_TYPES, validateQuestion, validateKey, paperMaxPoints } from "./paper.js";
+import { riskScore, importQuestions, EVENT_WEIGHTS } from "./grading.js";
 import {
-  $, $$, h, esc, toast, dialog, confirmDialog, promptDialog, fmtDate, fmtTime, ago, mmss, toDate,
-  toLocalInput, clear, downloadText, csvEscape, examCode, randomId,
+  $, $$, h, esc, toast, dialog, confirmDialog, promptDialog, fmtDate, fmtTime, ago, mmss,
+  toDate, toLocalInput, clear, downloadText, csvEscape, examCode, randomId,
 } from "./ui.js";
 
 const app = $("#app");
 $("#brandName").textContent = siteConfig.institutionName;
 
-const P = { user: null, profile: null, exams: [], unsubs: [], cache: {} };
+const P = { user: null, profile: null, unsubs: [] };
 
-const DEFAULT_SETTINGS = {
-  durationMinutes: 60, maxViolations: 5, violationAction: "lock", requireFullscreen: true, blockClipboard: true,
-  shuffleQuestions: true, shuffleOptions: true, questionsPerStudent: 0, oneAtATime: false, requireStudentId: true,
-  allowedDomain: "", roster: [], showCorrectAnswers: false, autoGrade: true,
-};
-
-// ---------------------------------------------------------------- auth / routing
+// ---------------------------------------------------------------- auth
 watchAuth(async (user) => {
   clear($("#topRight"));
-  if (!user) { clear(app); const host = h("div"); app.append(h("div.container.narrow", h("div.card", h("h2", "Professor sign-in"), host))); renderAuthPanel(host, { professorMode: true }); return; }
-  P.user = user;
-  P.profile = await ensureProfile(user);
-  if (P.profile.role !== "professor") {
-    // Bootstrap admin (e-mail hard-coded in firestore.rules) may claim the role.
-    try { await updateDoc(doc(db, "users", user.uid), { role: "professor", updatedAt: serverTimestamp() }); P.profile.role = "professor"; }
-    catch { /* not the bootstrap admin */ }
+  if (!user) {
+    clear(app);
+    const host = h("div");
+    app.append(h("div.container.narrow", h("div.card", h("h2", "Professor sign-in"), host)));
+    renderAuthPanel(host, { professorMode: true });
+    return;
   }
-  $("#topRight").append(h("span.small.muted", user.email), h("a.btn.btn-sm", { href: "./" }, "Student view"), h("button.btn.btn-sm", { onclick: () => logout() }, "Sign out"));
-  if (P.profile.role !== "professor") return renderNotProfessor(user);
+  P.user = user;
+  try { P.profile = await myProfile(); }
+  catch (e) { app.innerHTML = `<div class="container"><div class="card"><div class="form-error">${esc(e.friendly || e.message)}</div></div></div>`; return; }
+
+  $("#topRight").append(
+    h("span.small.muted", user.email),
+    h("a.btn.btn-sm", { href: "./" }, "Student view"),
+    h("button.btn.btn-sm", { onclick: () => logout() }, "Sign out"),
+  );
+  if (P.profile?.role !== "professor") return renderNotProfessor(user);
   window.addEventListener("hashchange", route);
   route();
 });
 
 function renderNotProfessor(user) {
   clear(app);
+  const codeI = h("input.input", { placeholder: "XXXXX-XXXXX-XXXXX", autocomplete: "off",
+    style: { textTransform: "uppercase", letterSpacing: ".08em" } });
+  const err = h("div.form-error", { hidden: true });
   app.append(h("div.container.narrow", h("div.card",
-    h("h2", "This account is not a professor"),
-    h("p", "Ask an existing professor to promote you from their ", h("strong", "Access"), " tab. Give them this e-mail:"),
-    h("p", h("code", user.email)),
-    h("p.help", "First deployment? Put your e-mail in BOOTSTRAP_ADMIN_EMAIL inside firestore.rules, deploy the rules, sign in with that (verified) e-mail and reload this page."),
+    h("h2", "This account is not a professor yet"),
+    h("p", "If you are setting this site up for the first time, enter the one-time " +
+           "bootstrap code from your deployment notes:"),
+    h("div.row", h("div", { style: { flex: 1 } }, codeI),
+      h("button.btn.btn-primary", { onclick: async () => {
+        err.hidden = true;
+        try {
+          await claimProfessor(codeI.value.trim().toUpperCase());
+          toast("You are now a professor.", "success");
+          P.profile = await myProfile();
+          location.reload();
+        } catch (e) { err.hidden = false; err.textContent = e.friendly || e.message; }
+      } }, "Become professor")),
+    err,
+    h("p.help", { style: { marginTop: "1rem" } },
+      "Otherwise ask an existing professor to add you from their ", h("strong", "Access"),
+      " tab. Give them this e-mail: ", h("code", user.email)),
   )));
 }
 
-function stopLive() { P.unsubs.forEach((u) => u()); P.unsubs = []; }
+const stopLive = () => { P.unsubs.forEach((u) => { try { u(); } catch {} }); P.unsubs = []; };
 
 function route() {
   stopLive();
-  const parts = (location.hash || "#exams").slice(1).split("/");
-  const [view, code, sub] = parts;
+  const [view, code, sub] = (location.hash || "#exams").slice(1).split("/");
   clear(app);
   const nav = h("nav.sidebar",
     link("#exams", "📚 My exams", view === "exams"),
@@ -73,7 +93,6 @@ function route() {
   );
   const main = h("main.main");
   app.append(h("div.dash", nav, main));
-  if (view === "exams") return viewExams(main);
   if (view === "new") return viewEditor(main, null);
   if (view === "exam" && code) {
     if (sub === "monitor") return viewMonitor(main, code);
@@ -86,123 +105,159 @@ function route() {
 }
 const link = (href, label, active) => h("a", { href, class: active ? "active" : "" }, label);
 
-// ---------------------------------------------------------------- data helpers
-async function loadExam(code, force = false) {
-  if (!force && P.cache[code]) return P.cache[code];
-  const [e, q, k] = await Promise.all([
-    getDoc(doc(db, "exams", code)),
-    getDoc(doc(db, "exams", code, "content", "questions")),
-    getDoc(doc(db, "exams", code, "private", "answerKey")),
-  ]);
-  if (!e.exists()) throw new Error("Exam not found");
-  const data = { exam: { id: code, ...e.data() }, questions: q.exists() ? q.data().questions || [] : [], key: k.exists() ? k.data().answers || {} : {} };
-  data.exam.settings = { ...DEFAULT_SETTINGS, ...(data.exam.settings || {}) };
-  P.cache[code] = data;
-  return data;
-}
+// ---------------------------------------------------------------- helpers
 const statusBadge = (st) => {
-  const m = { draft: ["Draft", ""], open: ["Open", "badge-success"], closed: ["Closed", "badge-danger"], in_progress: ["In progress", "badge-accent"], submitted: ["Submitted", "badge-success"], locked: ["Locked", "badge-danger"], terminated: ["Terminated", "badge-danger"], expired: ["Expired", "badge-warn"] };
-  const [l, c] = m[st] || [st, ""]; return h(`span.badge${c ? "." + c : ""}`, l);
+  const m = {
+    draft: ["Draft", ""], open: ["Open", "badge-success"], closed: ["Closed", "badge-danger"],
+    in_progress: ["In progress", "badge-accent"], submitted: ["Submitted", "badge-success"],
+    locked: ["Locked", "badge-danger"], terminated: ["Terminated", "badge-danger"],
+    expired: ["Expired", "badge-warn"],
+  };
+  const [l, c] = m[st] || [st, ""];
+  return h(`span.badge${c ? "." + c : ""}`, l);
 };
-/** Effective status: in_progress past its deadline (+grace) is "expired". */
-function effectiveStatus(s, exam) {
-  if (s.status !== "in_progress") return s.status;
-  const dl = deadlineOf(s, exam);
-  return dl && Date.now() > dl + 90_000 ? "expired" : "in_progress";
-}
-function deadlineOf(s, exam) {
-  const start = toDate(s.startedAt)?.getTime(); if (!start) return null;
-  const mins = (exam.settings.durationMinutes || 0) + (s.extraMinutes || 0);
-  return Math.min(start + mins * 60_000, toDate(exam.closesAt)?.getTime() || Infinity);
-}
 
-// ---------------------------------------------------------------- exams list
+const deadlineOf = (s, ex) => {
+  const start = toDate(s.started_at)?.getTime();
+  if (!start) return null;
+  const mins = (ex.duration_minutes || 0) + (s.extra_minutes || 0);
+  return Math.min(start + mins * 60_000, toDate(ex.closes_at)?.getTime() || Infinity);
+};
+const effectiveStatus = (s, ex) => {
+  if (s.status !== "in_progress") return s.status;
+  const dl = deadlineOf(s, ex);
+  return dl && Date.now() > dl + 90_000 ? "expired" : "in_progress";
+};
+
+// ------------------------------------------------------------- exams list
 async function viewExams(main) {
   main.append(h("div.card-head", h("h1", "My exams"), h("a.btn.btn-primary", { href: "#new" }, "➕ New exam")));
   const host = h("div.grid.grid-2"); main.append(host);
   try {
-    const snap = await getDocs(query(collection(db, "exams"), where("ownerUid", "==", P.user.uid)));
-    P.exams = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (toDate(b.updatedAt)?.getTime() || 0) - (toDate(a.updatedAt)?.getTime() || 0));
-    if (!P.exams.length) return host.append(h("div.empty", "No exams yet. Create one, or import your existing question list."));
-    for (const ex of P.exams) {
-      host.append(h("div.card.exam-tile", { onclick: () => (location.hash = `#exam/${ex.id}/${ex.status === "open" ? "monitor" : "edit"}`) },
-        h("div.card-head", h("div", h("h3", ex.title), h("div.small.muted", [ex.course, `${ex.questionCount || 0} questions`, `${ex.settings?.durationMinutes} min`].filter(Boolean).join(" · "))), statusBadge(ex.status)),
-        h("div.row.between", h("span.pill-code", { style: { fontSize: "1.1rem" } }, ex.id),
-          h("div.row", h("a.btn.btn-sm", { href: `#exam/${ex.id}/edit`, onclick: (e) => e.stopPropagation() }, "Edit"),
-            h("a.btn.btn-sm", { href: `#exam/${ex.id}/monitor`, onclick: (e) => e.stopPropagation() }, "Monitor"),
-            h("a.btn.btn-sm", { href: `#exam/${ex.id}/grades`, onclick: (e) => e.stopPropagation() }, "Grades"))),
-        h("div.small.muted", { style: { marginTop: ".5rem" } }, ex.scoresReleased ? "Scores released · " : "", `Updated ${ago(ex.updatedAt)}`),
+    const exams = await myExams();
+    if (!exams.length) {
+      return host.append(h("div.empty", "No exams yet. Create one, or import your existing question list."));
+    }
+    for (const ex of exams) {
+      host.append(h("div.card.exam-tile", {
+        onclick: () => (location.hash = `#exam/${ex.code}/${ex.status === "open" ? "monitor" : "edit"}`),
+      },
+        h("div.card-head",
+          h("div", h("h3", ex.title),
+            h("div.small.muted", [ex.course, `${ex.question_count} questions`, `${ex.duration_minutes} min`].filter(Boolean).join(" · "))),
+          statusBadge(ex.status)),
+        h("div.row.between",
+          h("span.pill-code", { style: { fontSize: "1.1rem" } }, ex.code),
+          h("div.row",
+            h("a.btn.btn-sm", { href: `#exam/${ex.code}/edit`, onclick: (e) => e.stopPropagation() }, "Edit"),
+            h("a.btn.btn-sm", { href: `#exam/${ex.code}/monitor`, onclick: (e) => e.stopPropagation() }, "Monitor"),
+            h("a.btn.btn-sm", { href: `#exam/${ex.code}/grades`, onclick: (e) => e.stopPropagation() }, "Grades"))),
+        h("div.small.muted", { style: { marginTop: ".5rem" } },
+          ex.scores_released ? "Scores released · " : "", `Updated ${ago(ex.updated_at)}`),
       ));
     }
-  } catch (e) { host.append(h("div.form-error", e.message)); }
+  } catch (e) { host.append(h("div.form-error", e.friendly || e.message)); }
 }
 
-// ---------------------------------------------------------------- editor
+// ----------------------------------------------------------------- editor
 async function viewEditor(main, code) {
-  let data;
+  let ex, questions = [];
   if (code) {
-    try { data = await loadExam(code, true); } catch (e) { return main.append(h("div.form-error", e.message)); }
+    try {
+      ex = await getExam(code);
+      if (!ex) throw new Error("Exam not found");
+      questions = (await examQuestionsWithKeys(code)).map((q) => ({
+        id: q.id, type: q.type, prompt: q.prompt,
+        options: (q.options || []).slice(), points: Number(q.points), key: q.key || {},
+      }));
+    } catch (e) { return main.append(h("div.form-error", e.friendly || e.message)); }
   } else {
-    data = {
-      exam: { id: null, title: "", course: "", instructions: "", ownerUid: P.user.uid, ownerName: P.profile.displayName || P.user.displayName || P.user.email, status: "draft",
-        opensAt: new Date(), closesAt: new Date(Date.now() + 30 * 86400_000), settings: { ...DEFAULT_SETTINGS }, scoresReleased: false },
-      questions: [], key: {},
+    ex = {
+      code: null, owner_id: P.user.id, owner_name: P.profile?.display_name || P.user.email,
+      title: "", course: "", instructions: "", status: "draft",
+      opens_at: new Date().toISOString(),
+      closes_at: new Date(Date.now() + 30 * 86400_000).toISOString(),
+      scores_released: false, duration_minutes: 60, max_violations: 5,
+      violation_action: "lock", require_fullscreen: true, block_clipboard: true,
+      shuffle_questions: true, shuffle_options: true, questions_per_student: 0,
+      one_at_a_time: false, require_student_id: true, show_correct_answers: false,
+      allowed_domain: "", roster: [],
     };
   }
-  const ex = data.exam, st = ex.settings;
-  let questions = data.questions.map((q) => ({ ...q })), key = JSON.parse(JSON.stringify(data.key));
-  let sessionsCount = 0;
-  if (code) { try { const s = await getDocs(query(collection(db, "sessions"), where("examCode", "==", code))); sessionsCount = s.size; } catch {} }
 
-  // ---- meta form
+  let sessionCount = 0;
+  if (code) { try { sessionCount = (await examSessions(code)).length; } catch {} }
+
   const f = {
     title: h("input.input", { value: ex.title, placeholder: "e.g. Information Assurance – Prelim Examination", required: true }),
     course: h("input.input", { value: ex.course || "", placeholder: "Course / subject (optional)" }),
-    ownerName: h("input.input", { value: ex.ownerName || "" }),
+    owner_name: h("input.input", { value: ex.owner_name || "" }),
     instructions: h("textarea", { placeholder: "Instructions shown to students before they start…" }, ex.instructions || ""),
-    opensAt: h("input.input", { type: "datetime-local", value: toLocalInput(ex.opensAt) }),
-    closesAt: h("input.input", { type: "datetime-local", value: toLocalInput(ex.closesAt) }),
-    durationMinutes: h("input.input", { type: "number", min: 1, max: 600, value: st.durationMinutes }),
-    maxViolations: h("input.input", { type: "number", min: 1, max: 50, value: st.maxViolations }),
-    violationAction: h("select", [["lock", "Lock exam – professor must unlock"], ["submit", "Auto-submit the exam"], ["warn", "Only warn & report"]].map(([v, l]) => h("option", { value: v, selected: st.violationAction === v }, l))),
-    questionsPerStudent: h("input.input", { type: "number", min: 0, value: st.questionsPerStudent || 0 }),
-    allowedDomain: h("input.input", { value: st.allowedDomain || "", placeholder: "e.g. perpetualdalta.edu.ph (blank = any)" }),
-    roster: h("textarea", { placeholder: "Optional: one student e-mail per line. Blank = anyone with the code (and domain) can take it." }, (st.roster || []).join("\n")),
-    requireFullscreen: chk("Require fullscreen", st.requireFullscreen),
-    blockClipboard: chk("Block copy / paste", st.blockClipboard),
-    shuffleQuestions: chk("Shuffle question order per student", st.shuffleQuestions),
-    shuffleOptions: chk("Shuffle answer options per student", st.shuffleOptions),
-    oneAtATime: chk("Show one question at a time", st.oneAtATime),
-    requireStudentId: chk("Require student ID & section", st.requireStudentId),
-    showCorrectAnswers: chk("Show correct answers to students when scores are released", st.showCorrectAnswers),
-    autoGrade: chk("Auto-grade submissions while the monitor is open", st.autoGrade),
+    opens_at: h("input.input", { type: "datetime-local", value: toLocalInput(ex.opens_at) }),
+    closes_at: h("input.input", { type: "datetime-local", value: toLocalInput(ex.closes_at) }),
+    duration_minutes: h("input.input", { type: "number", min: 1, max: 600, value: ex.duration_minutes }),
+    max_violations: h("input.input", { type: "number", min: 1, max: 50, value: ex.max_violations }),
+    violation_action: h("select", [["lock", "Lock exam – professor must unlock"], ["submit", "Auto-submit the exam"], ["warn", "Only warn & report"]]
+      .map(([v, l]) => h("option", { value: v, selected: ex.violation_action === v }, l))),
+    questions_per_student: h("input.input", { type: "number", min: 0, value: ex.questions_per_student || 0 }),
+    allowed_domain: h("input.input", { value: ex.allowed_domain || "", placeholder: "e.g. perpetualdalta.edu.ph (blank = any)" }),
+    roster: h("textarea", { placeholder: "Optional: one student e-mail per line. Blank = anyone with the code." },
+      (ex.roster || []).join("\n")),
+    require_fullscreen: chk("Require fullscreen", ex.require_fullscreen),
+    block_clipboard: chk("Block copy / paste", ex.block_clipboard),
+    shuffle_questions: chk("Shuffle question order per student", ex.shuffle_questions),
+    shuffle_options: chk("Shuffle answer options per student", ex.shuffle_options),
+    one_at_a_time: chk("Show one question at a time", ex.one_at_a_time),
+    require_student_id: chk("Require student ID & section", ex.require_student_id),
+    show_correct_answers: chk("Show correct answers to students when scores are released", ex.show_correct_answers),
   };
-  function chk(label, val) { const i = h("input", { type: "checkbox", checked: !!val }); const l = h("label.check", i, h("span", label)); l.input = i; return l; }
+  function chk(label, val) {
+    const i = h("input", { type: "checkbox", checked: !!val });
+    const l = h("label.check", i, h("span", label));
+    l.input = i; return l;
+  }
 
   const qHost = h("div#qHost");
-  const statsEl = h("span.muted.small");
-  const renderQuestions = () => {
+  const stats = h("span.muted.small");
+  const newQid = () => `new_${randomId(8)}`;
+
+  const render = () => {
     clear(qHost);
-    questions.forEach((q, i) => qHost.append(questionEditor(q, i)));
-    statsEl.textContent = `${questions.length} questions · ${paperMaxPoints(questions)} points`;
+    questions.forEach((q, i) => qHost.append(qEditor(q, i)));
+    stats.textContent = `${questions.length} questions · ${paperMaxPoints(questions)} points`;
   };
-  function questionEditor(q, i) {
-    const k = key[q.id] || (key[q.id] = {});
+
+  function qEditor(q, i) {
+    const k = q.key || (q.key = {});
     const box = h("div.q-editor", { dataset: { qid: q.id } });
-    const typeSel = h("select", Object.entries(QUESTION_TYPES).map(([v, l]) => h("option", { value: v, selected: q.type === v }, l)));
+    const typeSel = h("select", Object.entries(QUESTION_TYPES)
+      .map(([v, l]) => h("option", { value: v, selected: q.type === v }, l)));
     typeSel.style.maxWidth = "260px";
-    typeSel.onchange = () => { q.type = typeSel.value; if ((q.type === "mc" || q.type === "multi") && !q.options) q.options = ["", ""]; key[q.id] = {}; renderQuestions(); };
-    const prompt = h("textarea", { rows: 2, placeholder: "Question text", oninput: (e) => (q.prompt = e.target.value) }, q.prompt || "");
-    const pts = h("input.input", { type: "number", min: .5, step: .5, value: q.points ?? 1, style: { width: "80px" }, oninput: (e) => (q.points = Number(e.target.value)) });
+    typeSel.onchange = () => {
+      q.type = typeSel.value;
+      if ((q.type === "mc" || q.type === "multi") && (!q.options || q.options.length < 2)) q.options = ["", ""];
+      q.key = q.type === "tf" ? { correct: true } : {};
+      render();
+    };
+    const prompt = h("textarea", { rows: 2, placeholder: "Question text",
+      oninput: (e) => (q.prompt = e.target.value) }, q.prompt || "");
+    const pts = h("input.input", { type: "number", min: .5, step: .5, value: q.points ?? 1,
+      style: { width: "80px" }, oninput: (e) => (q.points = Number(e.target.value)) });
+
     box.append(h("div.row.between", { style: { marginBottom: ".5rem" } },
       h("div.row", h("strong", `Q${i + 1}`), typeSel, h("label.small.muted", "pts ", pts)),
       h("div.row",
-        h("button.btn.btn-sm.btn-ghost", { title: "Move up", onclick: () => { if (i > 0) { [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]]; renderQuestions(); } } }, "↑"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Move down", onclick: () => { if (i < questions.length - 1) { [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]]; renderQuestions(); } } }, "↓"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Duplicate", onclick: () => { const nq = { ...q, id: newQid(), options: q.options?.slice() }; questions.splice(i + 1, 0, nq); key[nq.id] = JSON.parse(JSON.stringify(k)); renderQuestions(); } }, "⧉"),
-        h("button.btn.btn-sm.btn-ghost", { title: "Delete", style: { color: "var(--danger)" }, onclick: () => { questions.splice(i, 1); delete key[q.id]; renderQuestions(); } }, "✕"),
-      )),
-      prompt);
+        h("button.btn.btn-sm.btn-ghost", { title: "Move up", onclick: () => {
+          if (i > 0) { [questions[i - 1], questions[i]] = [questions[i], questions[i - 1]]; render(); } } }, "↑"),
+        h("button.btn.btn-sm.btn-ghost", { title: "Move down", onclick: () => {
+          if (i < questions.length - 1) { [questions[i + 1], questions[i]] = [questions[i], questions[i + 1]]; render(); } } }, "↓"),
+        h("button.btn.btn-sm.btn-ghost", { title: "Duplicate", onclick: () => {
+          questions.splice(i + 1, 0, { ...q, id: newQid(), options: q.options?.slice(), key: JSON.parse(JSON.stringify(k)) });
+          render(); } }, "⧉"),
+        h("button.btn.btn-sm.btn-ghost", { title: "Delete", style: { color: "var(--danger)" },
+          onclick: () => { questions.splice(i, 1); render(); } }, "✕"),
+      )), prompt);
+
     const body = h("div", { style: { marginTop: ".5rem" } });
     if (q.type === "mc" || q.type === "multi") {
       q.options = q.options || ["", ""];
@@ -210,27 +265,54 @@ async function viewEditor(main, code) {
       const draw = () => {
         clear(rows);
         q.options.forEach((opt, oi) => {
-          const isCorrect = q.type === "mc" ? k.correct === oi : Array.isArray(k.correct) && k.correct.includes(oi);
-          const mark = h("input", { type: q.type === "mc" ? "radio" : "checkbox", name: `c_${q.id}`, checked: isCorrect, title: "Correct answer", onchange: (e) => {
-            if (q.type === "mc") k.correct = oi;
-            else { const s = new Set(k.correct || []); e.target.checked ? s.add(oi) : s.delete(oi); k.correct = [...s].sort(); }
-          } });
+          const isCorrect = q.type === "mc"
+            ? Number(k.correct) === oi
+            : Array.isArray(k.correct) && k.correct.map(Number).includes(oi);
+          const mark = h("input", { type: q.type === "mc" ? "radio" : "checkbox",
+            name: `c_${q.id}`, checked: isCorrect, title: "Correct answer",
+            onchange: (e) => {
+              if (q.type === "mc") k.correct = oi;
+              else {
+                const s = new Set((k.correct || []).map(Number));
+                e.target.checked ? s.add(oi) : s.delete(oi);
+                k.correct = [...s].sort((a, b) => a - b);
+              }
+            } });
           rows.append(h("div.opt-row", mark,
-            h("input.input", { value: opt, placeholder: `Option ${oi + 1}`, oninput: (e) => (q.options[oi] = e.target.value) }),
-            h("button.btn.btn-sm.btn-ghost", { onclick: () => { q.options.splice(oi, 1); if (q.type === "mc") { if (k.correct === oi) delete k.correct; else if (k.correct > oi) k.correct--; } else k.correct = (k.correct || []).filter((c) => c !== oi).map((c) => (c > oi ? c - 1 : c)); draw(); } }, "✕")));
+            h("input.input", { value: opt, placeholder: `Option ${oi + 1}`,
+              oninput: (e) => (q.options[oi] = e.target.value) }),
+            h("button.btn.btn-sm.btn-ghost", { onclick: () => {
+              q.options.splice(oi, 1);
+              if (q.type === "mc") {
+                if (Number(k.correct) === oi) delete k.correct;
+                else if (Number(k.correct) > oi) k.correct = Number(k.correct) - 1;
+              } else {
+                k.correct = (k.correct || []).map(Number).filter((c) => c !== oi).map((c) => (c > oi ? c - 1 : c));
+              }
+              draw();
+            } }, "✕")));
         });
       };
       draw();
       body.append(h("p.help", `Tick the correct ${q.type === "mc" ? "option" : "options"}.`), rows,
         h("div.row", h("button.btn.btn-sm", { onclick: () => { q.options.push(""); draw(); } }, "+ option"),
-          q.type === "multi" ? h("label.check.small", h("input", { type: "checkbox", checked: !!k.partialCredit, onchange: (e) => (k.partialCredit = e.target.checked) }), h("span", "Partial credit")) : null));
+          q.type === "multi" ? h("label.check.small",
+            h("input", { type: "checkbox", checked: !!k.partialCredit,
+              onchange: (e) => (k.partialCredit = e.target.checked) }),
+            h("span", "Partial credit")) : null));
     } else if (q.type === "tf") {
       body.append(h("div.row", h("span.small.muted", "Correct answer:"),
-        ...[[true, "True"], [false, "False"]].map(([v, l]) => h("label.check", h("input", { type: "radio", name: `c_${q.id}`, checked: k.correct === v, onchange: () => (k.correct = v) }), h("span", l)))));
+        ...[[true, "True"], [false, "False"]].map(([v, l]) => h("label.check",
+          h("input", { type: "radio", name: `c_${q.id}`, checked: k.correct === v,
+            onchange: () => (k.correct = v) }), h("span", l)))));
     } else if (q.type === "text") {
-      body.append(h("label.field", h("span", "Accepted answers (one per line – any of them earns the points)"),
-        h("textarea", { rows: 3, oninput: (e) => (k.accepted = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean)) }, (k.accepted || []).join("\n"))),
-        h("label.check.small", h("input", { type: "checkbox", checked: !!k.caseSensitive, onchange: (e) => (k.caseSensitive = e.target.checked) }), h("span", "Case sensitive")),
+      body.append(
+        h("label.field", h("span", "Accepted answers (one per line – any of them earns the points)"),
+          h("textarea", { rows: 3, oninput: (e) =>
+            (k.accepted = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean)) },
+            (k.accepted || []).join("\n"))),
+        h("label.check.small", h("input", { type: "checkbox", checked: !!k.caseSensitive,
+          onchange: (e) => (k.caseSensitive = e.target.checked) }), h("span", "Case sensitive")),
         h("p.help", "Matching ignores capitalisation (unless case sensitive), extra spaces and surrounding punctuation."));
     } else {
       body.append(h("p.help", "Essay answers are graded manually from the Grades tab."));
@@ -238,230 +320,260 @@ async function viewEditor(main, code) {
     box.append(body);
     return box;
   }
-  const newQid = () => `q_${randomId(6)}`;
 
-  const addQ = (type) => { const q = { id: newQid(), type, prompt: "", points: 1 }; if (type === "mc" || type === "multi") q.options = ["", "", "", ""]; questions.push(q); key[q.id] = type === "tf" ? { correct: true } : {}; renderQuestions(); qHost.lastElementChild?.scrollIntoView({ behavior: "smooth" }); };
+  const addQ = (type) => {
+    const q = { id: newQid(), type, prompt: "", points: 1, key: type === "tf" ? { correct: true } : {} };
+    if (type === "mc" || type === "multi") q.options = ["", "", "", ""];
+    questions.push(q); render();
+    qHost.lastElementChild?.scrollIntoView({ behavior: "smooth" });
+  };
 
   const errBox = h("div.form-error", { hidden: true });
+
   const collect = () => {
-    const opens = new Date(f.opensAt.value), closes = new Date(f.closesAt.value);
-    const settings = {
-      durationMinutes: Math.max(1, Math.min(600, parseInt(f.durationMinutes.value) || 60)),
-      maxViolations: Math.max(1, parseInt(f.maxViolations.value) || 5),
-      violationAction: f.violationAction.value,
-      questionsPerStudent: Math.max(0, parseInt(f.questionsPerStudent.value) || 0),
-      allowedDomain: f.allowedDomain.value.trim().toLowerCase().replace(/^@/, ""),
-      roster: f.roster.value.split(/[\n,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
-      requireFullscreen: f.requireFullscreen.input.checked, blockClipboard: f.blockClipboard.input.checked,
-      shuffleQuestions: f.shuffleQuestions.input.checked, shuffleOptions: f.shuffleOptions.input.checked,
-      oneAtATime: f.oneAtATime.input.checked, requireStudentId: f.requireStudentId.input.checked,
-      showCorrectAnswers: f.showCorrectAnswers.input.checked, autoGrade: f.autoGrade.input.checked,
-    };
+    const opens = new Date(f.opens_at.value), closes = new Date(f.closes_at.value);
     const errs = [];
     if (!f.title.value.trim()) errs.push("Title is required");
     if (isNaN(opens) || isNaN(closes)) errs.push("Set valid open/close dates");
     else if (closes <= opens) errs.push("Close date must be after open date");
-    questions.forEach((q, i) => { errs.push(...validateQuestion(q, i), ...validateKey(q, key[q.id], i)); });
-    if (settings.questionsPerStudent > questions.length) errs.push("Questions per student exceeds number of questions");
-    return { settings, opens, closes, errs };
+    questions.forEach((q, i) => errs.push(...validateQuestion(q, i), ...validateKey(q, q.key, i)));
+    const perStudent = Math.max(0, parseInt(f.questions_per_student.value) || 0);
+    if (perStudent > questions.length) errs.push("Questions per student exceeds the number of questions");
+    return { opens, closes, perStudent, errs };
   };
 
   async function save(newStatus) {
-    const { settings, opens, closes, errs } = collect();
+    const { opens, closes, perStudent, errs } = collect();
     const publishing = newStatus === "open" || (!newStatus && ex.status === "open");
-    const metaErrs = errs.filter((e) => /^(Title|Set|Close|Questions per)/.test(e));
-    // Drafts may be saved with incomplete questions; an OPEN exam may not.
-    const blocking = publishing ? errs : metaErrs;
+    const blocking = publishing ? errs : errs.filter((e) => /^(Title|Set|Close|Questions per)/.test(e));
     if (publishing && !questions.length) blocking.push("Add at least one question before publishing.");
-    if (blocking.length) { errBox.hidden = false; errBox.innerHTML = blocking.map(esc).join("<br>"); errBox.scrollIntoView({ behavior: "smooth" }); return false; }
+    if (blocking.length) {
+      errBox.hidden = false;
+      errBox.innerHTML = blocking.map(esc).join("<br>");
+      errBox.scrollIntoView({ behavior: "smooth" });
+      return false;
+    }
     errBox.hidden = true;
     if (errs.length) toast(`Saved as draft with ${errs.length} incomplete question(s).`, "warn", 5000);
-    const id = ex.id || examCode(6);
-    const status = newStatus || ex.status || "draft";
-    const cleanQuestions = questions.map((q) => { const c = { id: q.id, type: q.type, prompt: q.prompt.trim(), points: Number(q.points) || 1 }; if (q.options) c.options = q.options.map((o) => String(o).trim()); return c; });
-    const cleanKey = {}; for (const q of cleanQuestions) cleanKey[q.id] = key[q.id] || {};
-    const examDoc = {
-      ownerUid: P.user.uid, ownerName: f.ownerName.value.trim(), title: f.title.value.trim(), course: f.course.value.trim(), instructions: f.instructions.value,
-      status, opensAt: Timestamp.fromDate(opens), closesAt: Timestamp.fromDate(closes), settings, scoresReleased: !!ex.scoresReleased,
-      questionCount: cleanQuestions.length, totalPoints: paperMaxPoints(settings.questionsPerStudent ? cleanQuestions.slice(0, settings.questionsPerStudent) : cleanQuestions),
-      updatedAt: serverTimestamp(), createdAt: ex.createdAt || serverTimestamp(),
+
+    const codeToUse = ex.code || examCode(6);
+    const perQ = questions.length ? paperMaxPoints(questions) / questions.length : 0;
+    const row = {
+      code: codeToUse, owner_id: P.user.id, owner_name: f.owner_name.value.trim(),
+      title: f.title.value.trim(), course: f.course.value.trim(), instructions: f.instructions.value,
+      status: newStatus || ex.status || "draft",
+      opens_at: opens.toISOString(), closes_at: closes.toISOString(),
+      scores_released: !!ex.scores_released,
+      duration_minutes: Math.max(1, Math.min(600, parseInt(f.duration_minutes.value) || 60)),
+      max_violations: Math.max(1, parseInt(f.max_violations.value) || 5),
+      violation_action: f.violation_action.value,
+      require_fullscreen: f.require_fullscreen.input.checked,
+      block_clipboard: f.block_clipboard.input.checked,
+      shuffle_questions: f.shuffle_questions.input.checked,
+      shuffle_options: f.shuffle_options.input.checked,
+      questions_per_student: perStudent,
+      one_at_a_time: f.one_at_a_time.input.checked,
+      require_student_id: f.require_student_id.input.checked,
+      show_correct_answers: f.show_correct_answers.input.checked,
+      allowed_domain: f.allowed_domain.value.trim().toLowerCase().replace(/^@/, ""),
+      roster: f.roster.value.split(/[\n,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
+      question_count: questions.length,
+      total_points: perStudent ? Math.round(perQ * perStudent * 100) / 100 : paperMaxPoints(questions),
+      updated_at: new Date().toISOString(),
     };
-    if (settings.questionsPerStudent) examDoc.totalPoints = Math.round(paperMaxPoints(cleanQuestions) / cleanQuestions.length * settings.questionsPerStudent);
     try {
-      const b = writeBatch(db);
-      b.set(doc(db, "exams", id), examDoc);
-      b.set(doc(db, "exams", id, "content", "questions"), { questions: cleanQuestions, updatedAt: serverTimestamp() });
-      b.set(doc(db, "exams", id, "private", "answerKey"), { answers: cleanKey, updatedAt: serverTimestamp() });
-      await b.commit();
-      delete P.cache[id];
-      toast(newStatus === "open" ? `Published! Exam code: ${id}` : "Saved.", "success");
-      if (!ex.id) location.hash = `#exam/${id}/edit`; else route();
+      await saveExam(row);
+      await replaceQuestions(codeToUse, questions);
+      toast(newStatus === "open" ? `Published! Exam code: ${codeToUse}` : "Saved.", "success");
+      if (!ex.code) location.hash = `#exam/${codeToUse}/edit`; else route();
       return true;
-    } catch (e) { errBox.hidden = false; errBox.textContent = e.message; return false; }
+    } catch (e) {
+      errBox.hidden = false; errBox.textContent = e.friendly || e.message; return false;
+    }
   }
 
   async function importDialog() {
-    const ta = h("textarea", { rows: 12, placeholder: 'Paste JSON exported from this app, or the legacy JS array:\n[ { type: "text", q: "Question…", a: ["answer 1", "answer 2"] }, … ]', style: { fontFamily: "var(--mono)", fontSize: ".8rem" } });
-    const file = h("input", { type: "file", accept: ".json,.js,.txt", onchange: async (e) => { const fl = e.target.files[0]; if (fl) ta.value = await fl.text(); } });
-    const mode = h("select", h("option", { value: "append" }, "Append to existing questions"), h("option", { value: "replace" }, "Replace all questions"));
-    const ok = await dialog({ title: "Import questions", body: h("div.stack", h("p.help", "Accepted: our JSON export ({questions, answers}), a plain array of {type,q|prompt,a|accepted|correct,options}, or the exact baseQuizData array from the old single-file quiz."), file, ta, h("label.field", h("span", "Mode"), mode)),
-      buttons: [{ label: "Cancel", value: false }, { label: "Import", value: true, kind: "primary" }] });
+    const ta = h("textarea", { rows: 12, style: { fontFamily: "var(--mono)", fontSize: ".8rem" },
+      placeholder: 'Paste JSON exported from this app, or the legacy JS array:\n[ { type: "text", q: "Question…", a: ["answer 1", "answer 2"] }, … ]' });
+    const file = h("input", { type: "file", accept: ".json,.js,.txt",
+      onchange: async (e) => { const fl = e.target.files[0]; if (fl) ta.value = await fl.text(); } });
+    const mode = h("select", h("option", { value: "append" }, "Append to existing questions"),
+      h("option", { value: "replace" }, "Replace all questions"));
+    const ok = await dialog({
+      title: "Import questions",
+      body: h("div.stack",
+        h("p.help", "Accepted: our JSON export ({questions, answers}), a plain array of " +
+          "{type,q|prompt,a|accepted|correct,options}, or the exact baseQuizData array from the old single-file quiz."),
+        file, ta, h("label.field", h("span", "Mode"), mode)),
+      buttons: [{ label: "Cancel", value: false }, { label: "Import", value: true, kind: "primary" }],
+    });
     if (!ok) return;
     try {
       const { questions: qs, answers } = importQuestions(ta.value);
-      const used = new Set(questions.map((q) => q.id));
-      const incoming = qs.map((q) => { let id = q.id; if (!id || used.has(id) || mode.value === "append") id = newQid(); used.add(id); key[id] = answers[q.id] || {}; return { ...q, id }; });
-      if (mode.value === "replace") { for (const q of questions) delete key[q.id]; questions = incoming; } else questions.push(...incoming);
-      renderQuestions();
+      const incoming = qs.map((q) => ({
+        id: newQid(), type: q.type, prompt: q.prompt,
+        options: q.options || [], points: Number(q.points) || 1,
+        key: answers[q.id] || {},
+      }));
+      if (mode.value === "replace") questions = incoming; else questions.push(...incoming);
+      render();
       toast(`Imported ${incoming.length} questions.`, "success");
     } catch (e) { toast("Import failed: " + e.message, "error", 6000); }
   }
-  const exportJson = () => downloadText(`${(f.title.value || "exam").replace(/[^a-z0-9]+/gi, "-")}.json`, JSON.stringify({ title: f.title.value, questions, answers: key }, null, 2), "application/json");
+
+  const exportJson = () => downloadText(
+    `${(f.title.value || "exam").replace(/[^a-z0-9]+/gi, "-")}.json`,
+    JSON.stringify({
+      title: f.title.value,
+      questions: questions.map((q, i) => ({ id: `q${i + 1}`, type: q.type, prompt: q.prompt, options: q.options, points: q.points })),
+      answers: Object.fromEntries(questions.map((q, i) => [`q${i + 1}`, q.key || {}])),
+    }, null, 2), "application/json");
 
   main.append(
-    h("div.card-head", h("h1", ex.id ? "Edit exam" : "New exam"), h("div.row", ex.id ? h("span.pill-code", ex.id) : null, statusBadge(ex.status))),
-    sessionsCount && ex.status !== "draft" ? h("div.form-error", { style: { background: "var(--warn-soft)", color: "var(--warn)", marginBottom: "1rem" } }, `⚠ ${sessionsCount} student session(s) exist. Changing, adding or removing QUESTIONS now will scramble the per-student order and break grading for students who already started. Settings and dates are safe to change.`) : null,
+    h("div.card-head", h("h1", ex.code ? "Edit exam" : "New exam"),
+      h("div.row", ex.code ? h("span.pill-code", ex.code) : null, statusBadge(ex.status))),
+    sessionCount && ex.status !== "draft"
+      ? h("div.form-error", { style: { background: "var(--warn-soft)", color: "var(--warn)", marginBottom: "1rem" } },
+          `⚠ ${sessionCount} student session(s) exist. Changing, adding or removing QUESTIONS now ` +
+          `replaces them and will break grading for students who already started. Settings and dates are safe to change.`)
+      : null,
     errBox,
     h("div.card", h("h3", "Details"),
-      h("div.grid.grid-2", h("label.field", h("span", "Title *"), f.title), h("label.field", h("span", "Course"), f.course)),
+      h("div.grid.grid-2",
+        h("label.field", h("span", "Title *"), f.title),
+        h("label.field", h("span", "Course"), f.course)),
       h("label.field", { style: { marginTop: ".7rem" } }, h("span", "Instructions for students"), f.instructions),
       h("div.grid.grid-3", { style: { marginTop: ".7rem" } },
-        h("label.field", h("span", "Opens at"), f.opensAt), h("label.field", h("span", "Closes at (hard cut-off)"), f.closesAt), h("label.field", h("span", "Professor name shown"), f.ownerName)),
+        h("label.field", h("span", "Opens at"), f.opens_at),
+        h("label.field", h("span", "Closes at (hard cut-off)"), f.closes_at),
+        h("label.field", h("span", "Professor name shown"), f.owner_name)),
     ),
     h("div.card", h("h3", "Timing & anti-cheat"),
       h("div.grid.grid-3",
-        h("label.field", h("span", "Duration (minutes)"), f.durationMinutes),
-        h("label.field", h("span", "Violation limit"), f.maxViolations),
-        h("label.field", h("span", "When the limit is reached"), f.violationAction),
-      ),
-      h("div.grid.grid-2", { style: { marginTop: ".8rem" } }, f.requireFullscreen, f.blockClipboard, f.shuffleQuestions, f.shuffleOptions, f.oneAtATime, f.requireStudentId, f.showCorrectAnswers, f.autoGrade),
+        h("label.field", h("span", "Duration (minutes)"), f.duration_minutes),
+        h("label.field", h("span", "Violation limit"), f.max_violations),
+        h("label.field", h("span", "When the limit is reached"), f.violation_action)),
+      h("div.grid.grid-2", { style: { marginTop: ".8rem" } },
+        f.require_fullscreen, f.block_clipboard, f.shuffle_questions, f.shuffle_options,
+        f.one_at_a_time, f.require_student_id, f.show_correct_answers),
       h("div.grid.grid-3", { style: { marginTop: ".8rem" } },
-        h("label.field", h("span", "Questions per student (0 = all)"), f.questionsPerStudent, h("span.help", "Random subset per student from the pool below.")),
-        h("label.field", h("span", "Restrict to e-mail domain"), f.allowedDomain),
-        h("label.field", h("span", "Roster (allowed e-mails)"), f.roster),
-      ),
+        h("label.field", h("span", "Questions per student (0 = all)"), f.questions_per_student,
+          h("span.help", "Random subset per student, drawn from the pool below.")),
+        h("label.field", h("span", "Restrict to e-mail domain"), f.allowed_domain),
+        h("label.field", h("span", "Roster (allowed e-mails)"), f.roster)),
     ),
     h("div.card",
-      h("div.card-head", h("div", h("h3", "Questions"), statsEl),
-        h("div.row", h("button.btn.btn-sm", { onclick: importDialog }, "⬆ Import"), h("button.btn.btn-sm", { onclick: exportJson }, "⬇ Export JSON"))),
+      h("div.card-head", h("div", h("h3", "Questions"), stats),
+        h("div.row", h("button.btn.btn-sm", { onclick: importDialog }, "⬆ Import"),
+          h("button.btn.btn-sm", { onclick: exportJson }, "⬇ Export JSON"))),
       qHost,
       h("div.row", { style: { marginTop: ".8rem" } }, h("span.small.muted", "Add:"),
-        ...Object.entries(QUESTION_TYPES).map(([v, l]) => h("button.btn.btn-sm", { onclick: () => addQ(v) }, "+ " + l.split(" (")[0]))),
+        ...Object.entries(QUESTION_TYPES).map(([v, l]) =>
+          h("button.btn.btn-sm", { onclick: () => addQ(v) }, "+ " + l.split(" (")[0]))),
     ),
     h("div.card", h("div.row",
       h("button.btn.btn-primary", { onclick: () => save() }, "💾 Save"),
-      ex.status !== "open" ? h("button.btn.btn-success", { onclick: async () => { if (await confirmDialog("Publish exam?", "Students with the code will be able to start it within the open/close window.", "Publish", "success")) save("open"); } }, "🚀 Publish (open)") : null,
-      ex.status === "open" ? h("button.btn", { onclick: async () => { if (await confirmDialog("Close exam?", "Students can no longer start or continue. Sessions in progress will be cut off at their deadline or now, whichever is sooner.", "Close exam")) save("closed"); } }, "⏹ Close exam") : null,
+      ex.status !== "open" ? h("button.btn.btn-success", { onclick: async () => {
+        if (await confirmDialog("Publish exam?", "Students with the code will be able to start it within the open/close window.", "Publish", "success")) save("open");
+      } }, "🚀 Publish (open)") : null,
+      ex.status === "open" ? h("button.btn", { onclick: async () => {
+        if (await confirmDialog("Close exam?", "Students can no longer start or continue.", "Close exam")) save("closed");
+      } }, "⏹ Close exam") : null,
       ex.status === "closed" ? h("button.btn", { onclick: () => save("open") }, "Re-open") : null,
       h("div.spacer"),
-      ex.id ? h("button.btn.btn-sm", { onclick: async () => { const t = await promptDialog("Duplicate exam", "Title for the copy", ex.title + " (copy)"); if (!t) return; await duplicateExam(data, t); } }, "⧉ Duplicate") : null,
-      ex.id ? h("button.btn.btn-sm.btn-danger", { onclick: () => deleteExam(ex.id) }, "🗑 Delete exam") : null,
+      ex.code ? h("button.btn.btn-sm.btn-danger", { onclick: () => removeExam(ex.code) }, "🗑 Delete exam") : null,
     )),
   );
-  renderQuestions();
+  render();
 }
 
-async function duplicateExam(data, title) {
-  const id = examCode(6);
-  const b = writeBatch(db);
-  const { id: _omit, ...rest } = data.exam;
-  b.set(doc(db, "exams", id), { ...rest, title, status: "draft", scoresReleased: false, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
-  b.set(doc(db, "exams", id, "content", "questions"), { questions: data.questions, updatedAt: serverTimestamp() });
-  b.set(doc(db, "exams", id, "private", "answerKey"), { answers: data.key, updatedAt: serverTimestamp() });
-  await b.commit();
-  toast("Duplicated.", "success"); location.hash = `#exam/${id}/edit`;
-}
-
-async function deleteExam(code) {
-  if (!(await confirmDialog("Delete exam?", `This permanently deletes exam <b>${code}</b>, every student session, event log and grade. Export the grades first if you need them.`, "Delete everything"))) return;
+async function removeExam(code) {
+  if (!(await confirmDialog("Delete exam?",
+    `This permanently deletes exam <b>${code}</b>, every student session, event log and grade. Export the grades first if you need them.`,
+    "Delete everything"))) return;
   try {
-    const sess = await getDocs(query(collection(db, "sessions"), where("examCode", "==", code)));
-    for (const s of sess.docs) {
-      const evs = await getDocs(collection(db, "sessions", s.id, "events"));
-      await batchDelete([...evs.docs.map((d) => d.ref), doc(db, "grades", s.id), s.ref]);
-    }
-    await batchDelete([doc(db, "exams", code, "content", "questions"), doc(db, "exams", code, "private", "answerKey"), doc(db, "exams", code)]);
-    delete P.cache[code]; toast("Exam deleted.", "success"); location.hash = "#exams";
-  } catch (e) { toast(e.message, "error"); }
-}
-async function batchDelete(refs) {
-  for (let i = 0; i < refs.length; i += 400) { const b = writeBatch(db); refs.slice(i, i + 400).forEach((r) => b.delete(r)); await b.commit(); }
+    await deleteExam(code);   // cascades to questions, keys, sessions, events, grades
+    toast("Exam deleted.", "success");
+    location.hash = "#exams";
+  } catch (e) { toast(e.friendly || e.message, "error"); }
 }
 
-// ---------------------------------------------------------------- grading core (runs in professor's browser)
-async function computeGrade(data, session, sid, existing) {
-  const paper = buildPaper(data.questions, data.exam.settings, sid);
-  const overrides = existing?.overrides || {};
-  const g = gradeSession(paper, data.key, session.answers || {}, overrides);
-  if (data.exam.settings.showCorrectAnswers) {
-    for (const q of paper) {
-      const k = data.key[q.id]; if (!k) continue;
-      const row = g.perQuestion[q.id];
-      if (q.type === "text") row.expected = k.accepted || [];
-      else if (q.type !== "essay") row.expected = k.correct;
-    }
-  }
-  return {
-    sid, examCode: data.exam.id, uid: session.uid, email: session.email, displayName: session.displayName || "", studentId: session.studentId || "", section: session.section || "",
-    score: g.score, max: g.max, percent: g.percent, perQuestion: g.perQuestion, needsManual: g.needsManual, overrides,
-    feedback: existing?.feedback || "", gradedAt: serverTimestamp(), gradedBy: P.user.uid, auto: !Object.keys(overrides).length,
-  };
-}
-async function writeGrade(data, session, sid, existing) {
-  const grade = await computeGrade(data, session, sid, existing);
-  await setDoc(doc(db, "grades", sid), grade);
-  return grade;
-}
-
-// ---------------------------------------------------------------- live monitor
+// ----------------------------------------------------------- live monitor
 async function viewMonitor(main, code) {
-  let data; try { data = await loadExam(code, true); } catch (e) { return main.append(h("div.form-error", e.message)); }
-  const ex = data.exam;
+  let ex;
+  try { ex = await getExam(code); if (!ex) throw new Error("Exam not found"); }
+  catch (e) { return main.append(h("div.form-error", e.friendly || e.message)); }
+
   const sessions = new Map(), grades = new Map(), risks = new Map();
-  const autoGrading = new Set();
+  const grading = new Set();
 
   const stats = h("div.grid.grid-3", { style: { gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", marginBottom: "1rem" } });
   const tbody = h("tbody");
   const search = h("input.input", { placeholder: "Filter by name / e-mail / section…", style: { maxWidth: "300px" }, oninput: () => render() });
   const onlyFlag = h("input", { type: "checkbox", onchange: () => render() });
+
   main.append(
-    h("div.card-head", h("div", h("h1", ex.title), h("div.small.muted", `${ex.course || ""} · ${ex.settings.durationMinutes} min · limit ${ex.settings.maxViolations} violations (${ex.settings.violationAction})`)),
+    h("div.card-head",
+      h("div", h("h1", ex.title),
+        h("div.small.muted", `${ex.course || ""} · ${ex.duration_minutes} min · limit ${ex.max_violations} violations (${ex.violation_action})`)),
       h("div.row", h("span.pill-code", code), statusBadge(ex.status),
-        h("button.btn.btn-sm", { onclick: () => { navigator.clipboard?.writeText(`${location.origin}${location.pathname.replace(/professor\.html$/, "")}exam.html?code=${code}`); toast("Student link copied.", "success"); } }, "Copy student link"))),
-    ex.status !== "open" ? h("div.form-error", { style: { marginBottom: "1rem" } }, "This exam is not open. Students cannot start it. ", h("a", { href: `#exam/${code}/edit` }, "Publish it from the editor.")) : null,
+        h("button.btn.btn-sm", { onclick: () => {
+          const url = `${location.origin}${location.pathname.replace(/professor\.html$/, "")}exam.html?code=${code}`;
+          navigator.clipboard?.writeText(url);
+          toast("Student link copied.", "success");
+        } }, "Copy student link"))),
+    ex.status !== "open"
+      ? h("div.form-error", { style: { marginBottom: "1rem" } }, "This exam is not open, so students cannot start it. ",
+          h("a", { href: `#exam/${code}/edit` }, "Publish it from the editor."))
+      : null,
     stats,
     h("div.card",
-      h("div.row.between", { style: { marginBottom: ".7rem" } }, h("div.row", search, h("label.check.small", onlyFlag, h("span", "Only flagged / at-risk"))),
-        h("div.row", h("button.btn.btn-sm", { onclick: analyseAll }, "🔍 Analyse risk (loads event logs)"), h("button.btn.btn-sm", { onclick: () => exportCsv(data, sessions, grades, risks) }, "⬇ CSV"))),
-      h("div.table-wrap", h("table.table", h("thead", h("tr", h("th", "Student"), h("th", "Status"), h("th", "Progress"), h("th", "Time left"), h("th", "Violations"), h("th", "Risk"), h("th", "Score"), h("th", "Actions"))), tbody)),
+      h("div.row.between", { style: { marginBottom: ".7rem" } },
+        h("div.row", search, h("label.check.small", onlyFlag, h("span", "Only flagged / at-risk"))),
+        h("div.row",
+          h("button.btn.btn-sm", { onclick: analyseAll }, "🔍 Analyse risk (loads event logs)"),
+          h("button.btn.btn-sm", { onclick: () => exportCsv(ex, sessions, grades, risks) }, "⬇ CSV"))),
+      h("div.table-wrap", h("table.table",
+        h("thead", h("tr", h("th", "Student"), h("th", "Status"), h("th", "Progress"), h("th", "Time left"),
+          h("th", "Violations"), h("th", "Risk"), h("th", "Score"), h("th", "Actions"))),
+        tbody)),
     ),
   );
 
-  const unsub = onSnapshot(query(collection(db, "sessions"), where("examCode", "==", code)), (snap) => {
-    snap.docChanges().forEach((ch) => {
-      if (ch.type === "removed") { sessions.delete(ch.doc.id); return; }
-      const s = { id: ch.doc.id, ...ch.doc.data() };
-      sessions.set(s.id, s);
-      if (ch.type === "modified" || ch.type === "added") maybeAutoGrade(s);
-    });
-    render();
-  }, (e) => toast("Live monitor error: " + e.message, "error"));
-  const unsubG = onSnapshot(query(collection(db, "grades"), where("examCode", "==", code)), (snap) => {
-    snap.docChanges().forEach((ch) => ch.type === "removed" ? grades.delete(ch.doc.id) : grades.set(ch.doc.id, ch.doc.data()));
-    render();
-  });
-  P.unsubs.push(unsub, unsubG);
-  const ticker = setInterval(render, 5000); P.unsubs.push(() => clearInterval(ticker));
+  try {
+    (await examSessions(code)).forEach((s) => sessions.set(s.id, s));
+    (await examGrades(code)).forEach((g) => grades.set(g.session_id, g));
+  } catch (e) { toast(e.friendly || e.message, "error"); }
+  render();
 
-  async function maybeAutoGrade(s) {
-    if (!ex.settings.autoGrade || s.status !== "submitted" || grades.has(s.id) || autoGrading.has(s.id)) return;
-    autoGrading.add(s.id);
-    try { await writeGrade(data, s, s.id, null); } catch (e) { console.warn("auto-grade failed", e); } finally { autoGrading.delete(s.id); }
+  P.unsubs.push(watchExamSessions(code, ({ eventType, new: row, old }) => {
+    if (eventType === "DELETE") sessions.delete(old?.id);
+    else if (row) { sessions.set(row.id, row); maybeGrade(row); }
+    render();
+  }));
+  P.unsubs.push(watchExamGrades(code, ({ eventType, new: row, old }) => {
+    if (eventType === "DELETE") grades.delete(old?.session_id);
+    else if (row) grades.set(row.session_id, row);
+    render();
+  }));
+  const ticker = setInterval(render, 5000);
+  P.unsubs.push(() => clearInterval(ticker));
+
+  async function maybeGrade(s) {
+    if (s.status !== "submitted" || grades.has(s.id) || grading.has(s.id)) return;
+    grading.add(s.id);
+    try { grades.set(s.id, await gradeSession(s.id)); render(); }
+    catch (e) { console.warn("auto-grade failed", e); }
+    finally { grading.delete(s.id); }
   }
+
   async function analyseAll() {
     toast("Loading event logs…");
-    for (const s of sessions.values()) { risks.set(s.id, riskScore(s, await loadEvents(s.id), ex.settings)); }
-    render(); toast("Risk analysis done.", "success");
+    for (const s of sessions.values()) {
+      try { risks.set(s.id, riskScore(s, await sessionEvents(s.id), ex)); } catch {}
+    }
+    render();
+    toast("Risk analysis done.", "success");
   }
 
   function render() {
@@ -469,118 +581,184 @@ async function viewMonitor(main, code) {
     const q = search.value.trim().toLowerCase();
     const counts = { total: list.length, in_progress: 0, submitted: 0, locked: 0, expired: 0, online: 0, flagged: 0 };
     for (const s of list) {
-      const es = effectiveStatus(s, ex); counts[es] = (counts[es] || 0) + 1;
-      if (es === "in_progress" && Date.now() - (toDate(s.heartbeatAt)?.getTime() || 0) < 60_000) counts.online++;
-      if (s.flagged || risks.get(s.id)?.level === "high" || s.violations >= ex.settings.maxViolations) counts.flagged++;
+      const es = effectiveStatus(s, ex);
+      counts[es] = (counts[es] || 0) + 1;
+      if (es === "in_progress" && Date.now() - (toDate(s.heartbeat_at)?.getTime() || 0) < 60_000) counts.online++;
+      if (s.flagged || risks.get(s.id)?.level === "high" || s.violations >= ex.max_violations) counts.flagged++;
     }
     clear(stats);
-    [["Students", counts.total], ["Online now", counts.online], ["In progress", counts.in_progress], ["Submitted", counts.submitted], ["Locked", counts.locked], ["Expired", counts.expired], ["Flagged", counts.flagged]]
-      .forEach(([l, n]) => stats.append(h("div.stat", h("div.n", { style: l === "Flagged" && n ? { color: "var(--danger)" } : l === "Locked" && n ? { color: "var(--danger)" } : {} }, String(n)), h("div.l", l))));
+    [["Students", counts.total], ["Online now", counts.online], ["In progress", counts.in_progress],
+     ["Submitted", counts.submitted], ["Locked", counts.locked], ["Expired", counts.expired], ["Flagged", counts.flagged]]
+      .forEach(([l, n]) => stats.append(h("div.stat",
+        h("div.n", { style: (l === "Flagged" || l === "Locked") && n ? { color: "var(--danger)" } : {} }, String(n)),
+        h("div.l", l))));
 
     clear(tbody);
-    list.sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
+    list.sort((a, b) => (a.display_name || a.email).localeCompare(b.display_name || b.email));
+    let shown = 0;
     for (const s of list) {
       const es = effectiveStatus(s, ex), risk = risks.get(s.id), g = grades.get(s.id);
-      const flagged = s.flagged || risk?.level === "high" || s.violations >= ex.settings.maxViolations;
-      if (q && !`${s.displayName} ${s.email} ${s.studentId} ${s.section}`.toLowerCase().includes(q)) continue;
-      if (onlyFlag.checked && !flagged && !(risk?.level === "medium")) continue;
-      const hbAge = Date.now() - (toDate(s.heartbeatAt)?.getTime() || 0);
+      const flagged = s.flagged || risk?.level === "high" || s.violations >= ex.max_violations;
+      if (q && !`${s.display_name} ${s.email} ${s.student_no} ${s.section}`.toLowerCase().includes(q)) continue;
+      if (onlyFlag.checked && !flagged && risk?.level !== "medium") continue;
+      shown++;
+      const hbAge = Date.now() - (toDate(s.heartbeat_at)?.getTime() || 0);
       const dot = es !== "in_progress" ? "" : hbAge < 60_000 ? "dot-online" : hbAge < 180_000 ? "dot-idle" : "dot-offline";
       const dl = deadlineOf(s, ex);
-      const left = es === "in_progress" && dl ? mmss((dl - Date.now()) / 1000) : "—";
-      const tr = h("tr", { class: `risk-${risk?.level || (flagged ? "high" : "")}` },
-        h("td", h("div", dot ? h("span.dot", { class: `dot ${dot}`, title: `heartbeat ${ago(s.heartbeatAt)}` }) : null, h("strong", s.displayName || "—"), s.flagged ? " 🚩" : ""),
-          h("div.small.muted", `${s.email}${s.studentId ? " · " + s.studentId : ""}${s.section ? " · " + s.section : ""}`)),
-        h("td", statusBadge(es), h("div.small.muted", es === "submitted" ? fmtTime(s.submittedAt) : `started ${fmtTime(s.startedAt)}`)),
-        h("td", `${s.progress?.answered ?? Object.keys(s.answers || {}).length} / ${s.progress?.total || ex.questionCount || "?"}`),
-        h("td.mono", left, s.extraMinutes ? h("div.small.muted", `+${s.extraMinutes} min`) : null),
-        h("td", h("strong", { style: s.violations >= ex.settings.maxViolations ? { color: "var(--danger)" } : {} }, String(s.violations || 0)), h("span.muted.small", ` / ${ex.settings.maxViolations}`)),
-        h("td", risk ? h(`span.badge.badge-${risk.level === "high" ? "danger" : risk.level === "medium" ? "warn" : "success"}`, { title: risk.reasons.join(", ") }, `${risk.level} ${risk.score}`) : h("span.muted.small", "—")),
-        h("td", g ? h("span", h("strong", `${g.score}/${g.max}`), g.needsManual ? h("span.badge.badge-warn", { style: { marginLeft: ".3rem" }, title: "essay questions need manual grading" }, "manual") : null) : h("span.muted.small", es === "submitted" || es === "expired" ? "ungraded" : "—")),
+      tbody.append(h("tr", { class: `risk-${risk?.level || (flagged ? "high" : "")}` },
+        h("td",
+          h("div", dot ? h("span.dot", { class: `dot ${dot}`, title: `heartbeat ${ago(s.heartbeat_at)}` }) : null,
+            h("strong", s.display_name || "—"), s.flagged ? " 🚩" : ""),
+          h("div.small.muted", `${s.email}${s.student_no ? " · " + s.student_no : ""}${s.section ? " · " + s.section : ""}`)),
+        h("td", statusBadge(es),
+          h("div.small.muted", es === "submitted" ? fmtTime(s.submitted_at) : `started ${fmtTime(s.started_at)}`)),
+        h("td", `${s.answered} / ${s.total || ex.question_count || "?"}`),
+        h("td.mono", es === "in_progress" && dl ? mmss((dl - Date.now()) / 1000) : "—",
+          s.extra_minutes ? h("div.small.muted", `+${s.extra_minutes} min`) : null),
+        h("td", h("strong", { style: s.violations >= ex.max_violations ? { color: "var(--danger)" } : {} }, String(s.violations || 0)),
+          h("span.muted.small", ` / ${ex.max_violations}`)),
+        h("td", risk
+          ? h(`span.badge.badge-${risk.level === "high" ? "danger" : risk.level === "medium" ? "warn" : "success"}`,
+              { title: risk.reasons.join(", ") }, `${risk.level} ${risk.score}`)
+          : h("span.muted.small", "—")),
+        h("td", g
+          ? h("span", h("strong", `${Number(g.score)}/${Number(g.max_score)}`),
+              g.needs_manual ? h("span.badge.badge-warn", { style: { marginLeft: ".3rem" }, title: "essay questions need manual grading" }, "manual") : null)
+          : h("span.muted.small", ["submitted", "expired"].includes(es) ? "ungraded" : "—")),
         h("td", h("div.row", { style: { gap: ".3rem" } },
-          h("button.btn.btn-sm", { onclick: () => openDrawer(data, s, grades.get(s.id), risks) }, "View"),
-          es === "locked" ? h("button.btn.btn-sm.btn-success", { onclick: () => act(s, { status: "in_progress", unlockedAt: serverTimestamp() }, "Unlocked") }, "Unlock") : null,
-          es === "in_progress" || es === "locked" ? h("button.btn.btn-sm", { title: "Add time", onclick: async () => { const m = await promptDialog("Extra time", "Total extra minutes for this student", String(s.extraMinutes || 0), "number"); if (m != null) act(s, { extraMinutes: Math.max(0, parseInt(m) || 0) }, "Time updated"); } }, "+⏱") : null,
-          es === "in_progress" || es === "locked" || es === "expired" ? h("button.btn.btn-sm", { title: "Force submit with saved answers", onclick: async () => { if (await confirmDialog("Force submit?", `Submit ${esc(s.displayName || s.email)} now with their saved answers?`, "Submit", "primary")) act(s, { status: "submitted", submittedAt: serverTimestamp() }, "Submitted"); } }, "Submit") : null,
-          es !== "terminated" && es !== "submitted" ? h("button.btn.btn-sm.btn-danger", { title: "Terminate attempt", onclick: async () => { if (await confirmDialog("Terminate attempt?", "The student is thrown out and receives no score unless you grade manually.", "Terminate")) act(s, { status: "terminated", terminatedAt: serverTimestamp() }, "Terminated"); } }, "✕") : null,
-          h("button.btn.btn-sm.btn-ghost", { title: "Reset attempt (delete session so the student can start over)", onclick: async () => { if (await confirmDialog("Reset attempt?", `Delete ${esc(s.displayName || s.email)}'s session, events and grade so they can start again?`, "Reset")) { await resetSession(s.id); toast("Attempt reset.", "success"); } } }, "↺"),
+          h("button.btn.btn-sm", { onclick: () => openDrawer(ex, s, grades.get(s.id), risks, render) }, "View"),
+          es === "locked" ? h("button.btn.btn-sm.btn-success", {
+            onclick: () => act(s, { status: "in_progress" }, "Unlocked") } , "Unlock") : null,
+          ["in_progress", "locked"].includes(es) ? h("button.btn.btn-sm", { title: "Add time", onclick: async () => {
+            const m = await promptDialog("Extra time", "Total extra minutes for this student", String(s.extra_minutes || 0), "number");
+            if (m != null) act(s, { extra_minutes: Math.max(0, parseInt(m) || 0) }, "Time updated");
+          } }, "+⏱") : null,
+          ["in_progress", "locked", "expired"].includes(es) ? h("button.btn.btn-sm", {
+            title: "Force submit with saved answers", onclick: async () => {
+              if (await confirmDialog("Force submit?", `Submit ${esc(s.display_name || s.email)} now with their saved answers?`, "Submit", "primary"))
+                act(s, { status: "submitted", submitted_at: new Date().toISOString() }, "Submitted");
+            } }, "Submit") : null,
+          !["terminated", "submitted"].includes(es) ? h("button.btn.btn-sm.btn-danger", {
+            title: "Terminate attempt", onclick: async () => {
+              if (await confirmDialog("Terminate attempt?", "The student is thrown out and receives no score unless you grade manually.", "Terminate"))
+                act(s, { status: "terminated", terminated_at: new Date().toISOString() }, "Terminated");
+            } }, "✕") : null,
+          h("button.btn.btn-sm.btn-ghost", { title: "Reset attempt so the student can start again", onclick: async () => {
+            if (await confirmDialog("Reset attempt?", `Delete ${esc(s.display_name || s.email)}'s session, events and grade so they can start again?`, "Reset")) {
+              try { await resetSession(s.id); sessions.delete(s.id); grades.delete(s.id); render(); toast("Attempt reset.", "success"); }
+              catch (e) { toast(e.friendly || e.message, "error"); }
+            }
+          } }, "↺"),
         )),
-      );
-      tbody.append(tr);
+      ));
     }
-    if (!list.length) tbody.append(h("tr", h("td", { colspan: 8 }, h("div.empty", "No students have started yet. Share the code ", h("strong", code), "."))));
+    if (!shown) {
+      tbody.append(h("tr", h("td", { colspan: 8 }, h("div.empty",
+        list.length ? "No student matches that filter." : ["No students have started yet. Share the code ", h("strong", code), "."]))));
+    }
   }
+
   async function act(s, patch, msg) {
-    try { await updateDoc(doc(db, "sessions", s.id), { ...patch, updatedAt: serverTimestamp() }); toast(msg, "success"); }
-    catch (e) { toast(e.message, "error"); }
+    try { await profUpdateSession(s.id, patch); toast(msg, "success"); }
+    catch (e) { toast(e.friendly || e.message, "error"); }
   }
 }
 
-async function loadEvents(sid) {
-  const snap = await getDocs(query(collection(db, "sessions", sid, "events"), orderBy("at", "asc")));
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-}
-async function resetSession(sid) {
-  const evs = await getDocs(collection(db, "sessions", sid, "events"));
-  await batchDelete([...evs.docs.map((d) => d.ref), doc(db, "grades", sid), doc(db, "sessions", sid)]);
-}
+// ------------------------------------------------- student drawer + grading
+async function openDrawer(ex, s, grade, risks, onSaved) {
+  const events = await sessionEvents(s.id).catch(() => []);
+  const risk = riskScore(s, events, ex);
+  risks?.set(s.id, risk);
+  let paper = [];
+  try { paper = await getPaper(s.id); } catch {}
+  let g = grade;
+  if (!g) { try { g = await gradeSession(s.id); } catch {} }
+  const pq = g?.per_question || {};
 
-// ---------------------------------------------------------------- student drawer (review + manual grading)
-async function openDrawer(data, s, grade, risks) {
-  const ex = data.exam;
-  const events = await loadEvents(s.id);
-  const risk = riskScore(s, events, ex.settings); risks?.set(s.id, risk);
-  const paper = buildPaper(data.questions, ex.settings, s.id);
-  const overrides = JSON.parse(JSON.stringify(grade?.overrides || {}));
-  const feedback = h("textarea", { rows: 2, placeholder: "Feedback shown to the student with the score (optional)" }, grade?.feedback || "");
-  const note = h("textarea", { rows: 2, placeholder: "Private note (only professors see this)" }, s.note || "");
   const drawer = h("div.drawer");
   const close = () => drawer.remove();
-  const preview = gradeSession(paper, data.key, s.answers || {}, overrides);
-  const totalEl = h("div.stat", h("div.n", `${preview.score} / ${preview.max}`), h("div.l", `${preview.percent}%${preview.needsManual ? ` · ${preview.needsManual} to grade manually` : ""}`));
-  const refreshTotal = () => { const g = gradeSession(paper, data.key, s.answers || {}, overrides); totalEl.firstChild.textContent = `${g.score} / ${g.max}`; totalEl.lastChild.textContent = `${g.percent}%${g.needsManual ? ` · ${g.needsManual} to grade manually` : ""}`; };
+
+  const totalEl = h("div.stat",
+    h("div.n", g ? `${Number(g.score)} / ${Number(g.max_score)}` : "—"),
+    h("div.l", g ? `${g.percent}%${g.needs_manual ? ` · ${g.needs_manual} to grade` : ""}` : "not graded"));
 
   const tabs = h("div.tabs"); const panes = {};
-  const mk = (name, label) => { const b = h("button", { onclick: () => { $$("button", tabs).forEach((x) => x.classList.toggle("active", x === b)); Object.entries(panes).forEach(([k, p]) => (p.hidden = k !== name)); } }, label); tabs.append(b); panes[name] = h("div"); return panes[name]; };
-  const answersPane = mk("answers", "Answers & grading"), eventsPane = mk("events", `Event log (${events.length})`), infoPane = mk("info", "Device / info");
-  tabs.firstChild.classList.add("active"); eventsPane.hidden = true; infoPane.hidden = true;
+  const mk = (name, label) => {
+    const b = h("button", { onclick: () => {
+      $$("button", tabs).forEach((x) => x.classList.toggle("active", x === b));
+      Object.entries(panes).forEach(([k, p]) => (p.hidden = k !== name));
+    } }, label);
+    tabs.append(b); panes[name] = h("div"); return panes[name];
+  };
+  const answersPane = mk("answers", "Answers & grading");
+  const eventsPane = mk("events", `Event log (${events.length})`);
+  const infoPane = mk("info", "Device / info");
+  tabs.firstChild.classList.add("active");
+  eventsPane.hidden = infoPane.hidden = true;
 
-  // answers
   answersPane.append(h("div.answer-review", paper.map((q, i) => {
-    const r = preview.perQuestion[q.id]; const k = data.key[q.id];
-    const cls = r.correct === true ? "ok" : r.correct === "partial" ? "partial" : r.correct === false ? "bad" : "manual";
-    const earned = h("input.input", { type: "number", step: .5, min: 0, max: q.points, value: overrides[q.id]?.earned ?? r.earned, style: { width: "80px" }, oninput: (e) => { overrides[q.id] = { ...(overrides[q.id] || {}), earned: Number(e.target.value) }; refreshTotal(); } });
-    const comment = h("input.input", { placeholder: "comment to student (optional)", value: overrides[q.id]?.comment || "", oninput: (e) => { overrides[q.id] = { ...(overrides[q.id] || {}), earned: overrides[q.id]?.earned ?? r.earned, comment: e.target.value }; } });
+    const r = pq[q.id] || {};
+    const cls = r.verdict === "correct" ? "ok" : r.verdict === "partial" ? "partial"
+      : r.verdict === "wrong" ? "bad" : "manual";
+    const earned = h("input.input", { type: "number", step: .5, min: 0, max: Number(q.points),
+      value: Number(r.earned ?? 0), style: { width: "80px" } });
+    const comment = h("input.input", { placeholder: "comment to student (optional)", value: r.comment || "" });
+    const saveBtn = h("button.btn.btn-sm", { onclick: async () => {
+      saveBtn.disabled = true;
+      try {
+        const res = await setOverride(s.id, q.id, Number(earned.value), comment.value);
+        totalEl.firstChild.textContent = `${Number(res.score)} / ${Number(res.max_score)}`;
+        totalEl.lastChild.textContent = `${res.percent}%${res.needs_manual ? ` · ${res.needs_manual} to grade` : ""}`;
+        toast("Points saved.", "success");
+        onSaved?.();
+      } catch (e) { toast(e.friendly || e.message, "error"); }
+      finally { saveBtn.disabled = false; }
+    } }, "Save points");
     return h("div.ar", { class: `ar ${cls}` },
-      h("div.q-num", h("span", `Q${i + 1} · ${QUESTION_TYPES[q.type]?.split(" (")[0]}`), h("span.row", earned, h("span.muted", `/ ${q.points}`))),
+      h("div.q-num", h("span", `Q${i + 1} · ${QUESTION_TYPES[q.type]?.split(" (")[0]}`),
+        h("span.row", earned, h("span.muted", `/ ${Number(q.points)}`), saveBtn)),
       h("div", { style: { fontWeight: 600, margin: ".3rem 0" } }, q.prompt),
-      h("div.small", h("strong", "Student: "), fmtAnswer(q, s.answers?.[q.id])),
-      q.type !== "essay" ? h("div.small.muted", h("strong", "Key: "), fmtAnswer(q, q.type === "text" ? k?.accepted : k?.correct)) : null,
+      h("div.small", h("strong", "Student: "), fmtAnswer(q, r.answer)),
+      r.expected !== undefined ? h("div.small.muted", h("strong", "Key: "), fmtKey(q, r.expected)) : null,
       h("div", { style: { marginTop: ".4rem" } }, comment),
     );
   })));
+  if (!paper.length) answersPane.append(h("div.empty", "No paper to show."));
 
-  // events
   const counts = risk.counts || {};
   eventsPane.append(
-    h("div.row", { style: { marginBottom: ".6rem" } }, ...Object.entries(counts).sort((a, b) => (EVENT_WEIGHTS[b[0]] || 0) - (EVENT_WEIGHTS[a[0]] || 0)).map(([t, n]) => h(`span.badge${(EVENT_WEIGHTS[t] || 0) >= 3 ? ".badge-danger" : (EVENT_WEIGHTS[t] || 0) >= 1 ? ".badge-warn" : ""}`, `${t.replace(/_/g, " ")} ×${n}`))),
-    h("ul.timeline", events.map((e) => h("li", h("span.t", fmtTime(e.at)), h("span", h("strong", e.type.replace(/_/g, " ")), e.detail && Object.keys(e.detail).length ? h("span.muted.small", " " + summarizeDetail(e)) : null)))),
+    h("div.row", { style: { marginBottom: ".6rem" } },
+      ...Object.entries(counts).sort((a, b) => (EVENT_WEIGHTS[b[0]] || 0) - (EVENT_WEIGHTS[a[0]] || 0))
+        .map(([t, n]) => h(`span.badge${(EVENT_WEIGHTS[t] || 0) >= 3 ? ".badge-danger" : (EVENT_WEIGHTS[t] || 0) >= 1 ? ".badge-warn" : ""}`,
+          `${t.replace(/_/g, " ")} ×${n}`))),
+    h("ul.timeline", events.map((e) => h("li", h("span.t", fmtTime(e.at)),
+      h("span", h("strong", e.type.replace(/_/g, " ")),
+        e.detail && Object.keys(e.detail).length ? h("span.muted.small", " " + summarize(e)) : null)))),
     !events.length ? h("div.empty", "No events recorded.") : null,
   );
 
-  // info
   const c = s.client || {};
   infoPane.append(h("div.stack",
-    kv("Session id", s.id), kv("E-mail", s.email), kv("Student ID", s.studentId || "—"), kv("Section", s.section || "—"),
-    kv("Started", fmtDate(s.startedAt)), kv("Submitted", fmtDate(s.submittedAt)), kv("Last heartbeat", fmtDate(s.heartbeatAt)), kv("Last saved", fmtDate(s.lastSavedAt)),
-    kv("Extra time", `${s.extraMinutes || 0} min`), kv("Browser", c.ua || "—"), kv("Platform", `${c.platform || "—"} · ${c.lang || ""} · ${c.tz || ""}`),
-    kv("Screen / viewport", `${c.screen || "—"} / ${c.viewport || "—"}`), kv("Touch device", c.touch ? "yes" : "no"), kv("Other tabs seen", counts.multiple_tabs ? "YES" : "no"),
+    kv("Session id", s.id), kv("E-mail", s.email), kv("Student ID", s.student_no || "—"),
+    kv("Section", s.section || "—"), kv("Started", fmtDate(s.started_at)),
+    kv("Submitted", fmtDate(s.submitted_at)), kv("Last heartbeat", fmtDate(s.heartbeat_at)),
+    kv("Last saved", fmtDate(s.last_saved_at)), kv("Extra time", `${s.extra_minutes || 0} min`),
+    kv("Browser", c.ua || "—"), kv("Platform", `${c.platform || "—"} · ${c.lang || ""} · ${c.tz || ""}`),
+    kv("Screen / viewport", `${c.screen || "—"} / ${c.viewport || "—"}`),
+    kv("Touch device", c.touch ? "yes" : "no"),
+    kv("Second tab seen", counts.multiple_tabs ? "YES" : "no"),
   ));
 
+  const feedback = h("textarea", { rows: 2, placeholder: "Feedback shown to the student with the score (optional)" }, g?.feedback || "");
+  const note = h("textarea", { rows: 2, placeholder: "Private note (professors only)" }, s.note || "");
+
   drawer.append(
-    h("div.row.between", h("div", h("h2", s.displayName || s.email), h("div.small.muted", s.email), statusBadge(effectiveStatus(s, ex))), h("button.btn.btn-ghost", { onclick: close }, "✕ Close")),
+    h("div.row.between",
+      h("div", h("h2", s.display_name || s.email), h("div.small.muted", s.email), statusBadge(effectiveStatus(s, ex))),
+      h("button.btn.btn-ghost", { onclick: close }, "✕ Close")),
     h("div.grid.grid-3", { style: { margin: ".8rem 0" } }, totalEl,
-      h("div.stat", h("div.n", { style: { color: risk.level === "high" ? "var(--danger)" : risk.level === "medium" ? "var(--warn)" : "var(--success)" } }, `${risk.level.toUpperCase()} ${risk.score}`), h("div.l", "Risk score")),
+      h("div.stat", h("div.n", { style: { color: risk.level === "high" ? "var(--danger)" : risk.level === "medium" ? "var(--warn)" : "var(--success)" } },
+        `${risk.level.toUpperCase()} ${risk.score}`), h("div.l", "Risk score")),
       h("div.stat", h("div.n", String(s.violations || 0)), h("div.l", "Violations"))),
     risk.reasons.length ? h("p.small", h("strong", "Why: "), risk.reasons.join(" · ")) : null,
     tabs, answersPane, eventsPane, infoPane,
@@ -590,169 +768,206 @@ async function openDrawer(data, s, grade, risks) {
       h("div.row", { style: { marginTop: ".7rem" } },
         h("button.btn.btn-primary", { onclick: async () => {
           try {
-            const cleanOv = {}; for (const [k, v] of Object.entries(overrides)) if (v.earned != null || v.comment) cleanOv[k] = v;
-            await writeGrade(data, s, s.id, { overrides: cleanOv, feedback: feedback.value });
-            await updateDoc(doc(db, "sessions", s.id), { note: note.value, reviewed: true, updatedAt: serverTimestamp() });
-            toast("Grade saved.", "success"); close();
-          } catch (e) { toast(e.message, "error"); }
-        } }, "💾 Save grade & note"),
-        h("button.btn", { onclick: async () => { await updateDoc(doc(db, "sessions", s.id), { flagged: !s.flagged, updatedAt: serverTimestamp() }); toast(s.flagged ? "Flag removed" : "Flagged", "success"); close(); } }, s.flagged ? "🏳 Unflag" : "🚩 Flag for review"),
+            await setFeedback(s.id, feedback.value);
+            await profUpdateSession(s.id, { note: note.value, reviewed: true });
+            toast("Saved.", "success"); onSaved?.(); close();
+          } catch (e) { toast(e.friendly || e.message, "error"); }
+        } }, "💾 Save feedback & note"),
+        h("button.btn", { onclick: async () => {
+          try { await profUpdateSession(s.id, { flagged: !s.flagged }); toast(s.flagged ? "Flag removed" : "Flagged", "success"); onSaved?.(); close(); }
+          catch (e) { toast(e.friendly || e.message, "error"); }
+        } }, s.flagged ? "🏳 Unflag" : "🚩 Flag for review"),
         h("div.spacer"),
-        h("a.small", { href: "#", onclick: (e) => { e.preventDefault(); downloadText(`${s.id}-events.json`, JSON.stringify(events.map((ev) => ({ ...ev, at: toDate(ev.at)?.toISOString() })), null, 2), "application/json"); } }, "download event log"),
+        h("a.small", { href: "#", onclick: (e) => {
+          e.preventDefault();
+          downloadText(`${s.id}-events.json`, JSON.stringify(events, null, 2), "application/json");
+        } }, "download event log"),
       )),
   );
   document.body.append(drawer);
 }
-const kv = (k, v) => h("div.row.between", { style: { borderBottom: "1px dashed var(--border)", padding: ".25rem 0" } }, h("span.muted.small", k), h("span.small.mono", { style: { textAlign: "right", wordBreak: "break-all" } }, v));
+
+const kv = (k, v) => h("div.row.between",
+  { style: { borderBottom: "1px dashed var(--border)", padding: ".25rem 0" } },
+  h("span.muted.small", k),
+  h("span.small.mono", { style: { textAlign: "right", wordBreak: "break-all" } }, v));
+
 function fmtAnswer(q, a) {
   if (a === undefined || a === null || a === "" || (Array.isArray(a) && !a.length)) return h("em.muted", "—");
-  if (q.type === "mc") return optText(q, a);
-  if (q.type === "multi") return (Array.isArray(a) ? a : [a]).map((v) => optText(q, v)).join("; ");
+  if (q.type === "mc") return q.options?.find((o) => o.oi === Number(a))?.text ?? String(a);
+  if (q.type === "multi") return (Array.isArray(a) ? a : [a]).map((v) => q.options?.find((o) => o.oi === Number(v))?.text ?? v).join("; ");
   if (q.type === "tf") return String(a) === "true" ? "True" : "False";
-  if (Array.isArray(a)) return a.join(" / ");
   return String(a);
 }
-// paper options are {oi, text}; raw editor options are strings
-const optText = (q, v) => {
-  const o = (q.options || []).find((x) => typeof x === "object" && x.oi === Number(v)) ?? q.options?.[Number(v)];
-  return typeof o === "string" ? o : o?.text ?? String(v);
-};
-function summarizeDetail(e) {
-  const d = e.detail || {};
-  const parts = [];
+function fmtKey(q, key) {
+  if (!key) return h("em.muted", "—");
+  if (q.type === "text") return (key.accepted || []).join(" / ");
+  if (q.type === "tf") return key.correct ? "True" : "False";
+  if (q.type === "mc") return q.options?.find((o) => o.oi === Number(key.correct))?.text ?? String(key.correct);
+  if (q.type === "multi") return (key.correct || []).map((v) => q.options?.find((o) => o.oi === Number(v))?.text ?? v).join("; ");
+  return "—";
+}
+function summarize(e) {
+  const d = e.detail || {}, parts = [];
   if (d.ms) parts.push(`${Math.round(d.ms / 1000)}s away`);
   if (d.key) parts.push(d.key);
   if (d.len) parts.push(`${d.len} chars`);
   if (d.reason) parts.push(d.reason);
   if (d.reload) parts.push("after reload");
-  if (d.offsetMs) parts.push(`clock off by ${Math.round(d.offsetMs / 1000)}s`);
   if (d.w) parts.push(`${d.w}×${d.h}`);
-  if (e.q) parts.push(`on ${e.q}`);
+  if (e.question) parts.push(`on ${e.question}`);
   return parts.join(", ");
 }
 
-// ---------------------------------------------------------------- grades view
+// ----------------------------------------------------------------- grades
 async function viewGrades(main, code) {
-  let data; try { data = await loadExam(code, true); } catch (e) { return main.append(h("div.form-error", e.message)); }
-  const ex = data.exam;
-  const [sessSnap, gradeSnap] = await Promise.all([getDocs(query(collection(db, "sessions"), where("examCode", "==", code))), getDocs(query(collection(db, "grades"), where("examCode", "==", code)))]);
-  const sessions = new Map(sessSnap.docs.map((d) => [d.id, { id: d.id, ...d.data() }]));
-  const grades = new Map(gradeSnap.docs.map((d) => [d.id, d.data()]));
+  let ex;
+  try { ex = await getExam(code); if (!ex) throw new Error("Exam not found"); }
+  catch (e) { return main.append(h("div.form-error", e.friendly || e.message)); }
+
+  const sessions = new Map((await examSessions(code)).map((s) => [s.id, s]));
+  const grades = new Map((await examGrades(code)).map((g) => [g.session_id, g]));
   const risks = new Map();
 
-  const releaseBtn = h("button.btn", { class: `btn ${ex.scoresReleased ? "" : "btn-success"}`, onclick: async () => {
-    const releasing = !ex.scoresReleased;
-    if (!(await confirmDialog(releasing ? "Release scores?" : "Hide scores?", releasing ? `Students will see their score${ex.settings.showCorrectAnswers ? " and the correct answers" : ""} on their home page. Ungraded submissions are graded first.` : "Students will no longer see their scores.", releasing ? "Release" : "Hide", "primary"))) return;
-    try {
-      if (releasing) await gradeAll(false);
-      await updateDoc(doc(db, "exams", code), { scoresReleased: releasing, updatedAt: serverTimestamp() });
-      ex.scoresReleased = releasing; delete P.cache[code]; toast(releasing ? "Scores released." : "Scores hidden.", "success"); route();
-    } catch (e) { toast(e.message, "error"); }
-  } }, ex.scoresReleased ? "🙈 Hide scores" : "📢 Release scores");
-
-  main.append(
-    h("div.card-head", h("div", h("h1", "Grades"), h("div.small.muted", ex.title)), h("div.row", h("span.pill-code", code), ex.scoresReleased ? h("span.badge.badge-success", "Released") : h("span.badge", "Not released"))),
-    h("div.card", h("div.row",
-      h("button.btn.btn-primary", { onclick: () => gradeAll(false) }, "⚡ Grade ungraded"),
-      h("button.btn", { onclick: () => gradeAll(true), title: "Recomputes every grade with the current answer key; keeps manual overrides" }, "♻ Regrade all"),
-      releaseBtn,
-      h("div.spacer"),
-      h("button.btn", { onclick: () => exportCsv(data, sessions, grades, risks) }, "⬇ Export CSV"),
-    ), h("p.help", { style: { marginTop: ".6rem" } }, "Grading runs in your browser using the private answer key – students never download it. Sessions still 'in progress' whose time has expired are graded from their last saved answers. Essay questions need manual points (click a row).")),
-    h("div.card", h("div.table-wrap", h("table.table", h("thead", h("tr", h("th", "Student"), h("th", "Section"), h("th", "Status"), h("th", "Submitted"), h("th", "Violations"), h("th", "Score"), h("th", "%"), h("th", ""))), tbodyEl()))),
-  );
-  function tbodyEl() {
-    const tb = h("tbody#gradesBody");
-    const list = [...sessions.values()].sort((a, b) => (a.displayName || a.email).localeCompare(b.displayName || b.email));
-    if (!list.length) tb.append(h("tr", h("td", { colspan: 8 }, h("div.empty", "No submissions yet."))));
+  const body = h("tbody#gradesBody");
+  const fill = () => {
+    clear(body);
+    const list = [...sessions.values()].sort((a, b) => (a.display_name || a.email).localeCompare(b.display_name || b.email));
+    if (!list.length) body.append(h("tr", h("td", { colspan: 8 }, h("div.empty", "No submissions yet."))));
     for (const s of list) {
       const g = grades.get(s.id), es = effectiveStatus(s, ex);
-      tb.append(h("tr", { class: s.flagged || s.violations >= ex.settings.maxViolations ? "risk-high" : "" },
-        h("td", h("strong", s.displayName || "—"), s.flagged ? " 🚩" : "", h("div.small.muted", `${s.email}${s.studentId ? " · " + s.studentId : ""}`)),
-        h("td", s.section || "—"), h("td", statusBadge(es)), h("td", fmtDate(s.submittedAt)), h("td", String(s.violations || 0)),
-        h("td", g ? h("strong", `${g.score} / ${g.max}`) : h("span.muted", "—"), g?.needsManual ? h("span.badge.badge-warn", { style: { marginLeft: ".3rem" } }, `${g.needsManual} manual`) : null),
+      body.append(h("tr", { class: s.flagged || s.violations >= ex.max_violations ? "risk-high" : "" },
+        h("td", h("strong", s.display_name || "—"), s.flagged ? " 🚩" : "",
+          h("div.small.muted", `${s.email}${s.student_no ? " · " + s.student_no : ""}`)),
+        h("td", s.section || "—"), h("td", statusBadge(es)), h("td", fmtDate(s.submitted_at)),
+        h("td", String(s.violations || 0)),
+        h("td", g ? h("strong", `${Number(g.score)} / ${Number(g.max_score)}`) : h("span.muted", "—"),
+          g?.needs_manual ? h("span.badge.badge-warn", { style: { marginLeft: ".3rem" } }, `${g.needs_manual} manual`) : null),
         h("td", g ? `${g.percent}%` : "—"),
-        h("td", h("button.btn.btn-sm", { onclick: () => openDrawer(data, s, g, risks) }, "Review")),
+        h("td", h("button.btn.btn-sm", { onclick: () => openDrawer(ex, s, g, risks, refresh) }, "Review")),
       ));
     }
-    return tb;
+  };
+  async function refresh() {
+    (await examGrades(code)).forEach((g) => grades.set(g.session_id, g));
+    (await examSessions(code)).forEach((s) => sessions.set(s.id, s));
+    fill();
   }
-  async function gradeAll(regrade) {
-    let n = 0;
-    for (const s of sessions.values()) {
-      const es = effectiveStatus(s, ex);
-      if (!["submitted", "expired", "terminated"].includes(es)) continue;
-      if (!regrade && grades.has(s.id)) continue;
-      try { const g = await writeGrade(data, s, s.id, grades.get(s.id)); grades.set(s.id, g); n++; } catch (e) { console.warn(e); }
-    }
-    toast(`Graded ${n} submission(s).`, "success");
-    const old = $("#gradesBody"); if (old) old.replaceWith(tbodyEl());
-  }
+
+  const releaseBtn = h("button.btn", { class: `btn ${ex.scores_released ? "" : "btn-success"}`, onclick: async () => {
+    const releasing = !ex.scores_released;
+    if (!(await confirmDialog(releasing ? "Release scores?" : "Hide scores?",
+      releasing ? `Students will see their score${ex.show_correct_answers ? " and the correct answers" : ""}. Ungraded submissions are graded first.`
+                : "Students will no longer see their scores.",
+      releasing ? "Release" : "Hide", "primary"))) return;
+    try {
+      if (releasing) { const n = await gradeExam(code, false); if (n) toast(`Graded ${n} submission(s).`, "success"); }
+      await releaseScores(code, releasing);
+      toast(releasing ? "Scores released." : "Scores hidden.", "success");
+      route();
+    } catch (e) { toast(e.friendly || e.message, "error"); }
+  } }, ex.scores_released ? "🙈 Hide scores" : "📢 Release scores");
+
+  main.append(
+    h("div.card-head", h("div", h("h1", "Grades"), h("div.small.muted", ex.title)),
+      h("div.row", h("span.pill-code", code),
+        ex.scores_released ? h("span.badge.badge-success", "Released") : h("span.badge", "Not released"))),
+    h("div.card", h("div.row",
+      h("button.btn.btn-primary", { onclick: async () => {
+        try { const n = await gradeExam(code, false); toast(`Graded ${n} submission(s).`, "success"); refresh(); }
+        catch (e) { toast(e.friendly || e.message, "error"); }
+      } }, "⚡ Grade ungraded"),
+      h("button.btn", { title: "Recompute every grade with the current answer key; manual points are kept",
+        onclick: async () => {
+          try { const n = await gradeExam(code, true); toast(`Regraded ${n} submission(s).`, "success"); refresh(); }
+          catch (e) { toast(e.friendly || e.message, "error"); }
+        } }, "♻ Regrade all"),
+      releaseBtn,
+      h("div.spacer"),
+      h("button.btn", { onclick: () => exportCsv(ex, sessions, grades, risks) }, "⬇ Export CSV"),
+    ), h("p.help", { style: { marginTop: ".6rem" } },
+      "Grading runs inside the database, so the answer key is never sent to this browser. " +
+      "Attempts whose time has expired are graded from their last saved answers. " +
+      "Essay questions need manual points — click Review.")),
+    h("div.card", h("div.table-wrap", h("table.table",
+      h("thead", h("tr", h("th", "Student"), h("th", "Section"), h("th", "Status"), h("th", "Submitted"),
+        h("th", "Violations"), h("th", "Score"), h("th", "%"), h("th", ""))),
+      body))),
+  );
+  fill();
 }
 
-function exportCsv(data, sessions, grades, risks) {
-  const ex = data.exam;
-  const rows = [["Name", "Email", "Student ID", "Section", "Status", "Started", "Submitted", "Violations", "Risk level", "Risk score", "Risk reasons", "Flagged", "Score", "Max", "Percent", "Needs manual", "Note"]];
+function exportCsv(ex, sessions, grades, risks) {
+  const rows = [["Name", "Email", "Student ID", "Section", "Status", "Started", "Submitted", "Violations",
+    "Risk level", "Risk score", "Risk reasons", "Flagged", "Score", "Max", "Percent", "Needs manual", "Note"]];
   for (const s of sessions.values()) {
     const g = grades.get(s.id), r = risks.get(s.id);
-    rows.push([s.displayName, s.email, s.studentId, s.section, effectiveStatus(s, ex), toDate(s.startedAt)?.toISOString() || "", toDate(s.submittedAt)?.toISOString() || "",
-      s.violations || 0, r?.level || "", r?.score ?? "", r?.reasons.join("; ") || "", s.flagged ? "yes" : "", g?.score ?? "", g?.max ?? "", g?.percent ?? "", g?.needsManual ?? "", s.note || ""]);
+    rows.push([s.display_name, s.email, s.student_no, s.section, effectiveStatus(s, ex),
+      s.started_at || "", s.submitted_at || "", s.violations || 0,
+      r?.level || "", r?.score ?? "", r?.reasons.join("; ") || "", s.flagged ? "yes" : "",
+      g?.score ?? "", g?.max_score ?? "", g?.percent ?? "", g?.needs_manual ?? "", s.note || ""]);
   }
-  downloadText(`${ex.id}-${ex.title.replace(/[^a-z0-9]+/gi, "-")}-grades.csv`, rows.map((r) => r.map(csvEscape).join(",")).join("\r\n"), "text/csv");
+  downloadText(`${ex.code}-${ex.title.replace(/[^a-z0-9]+/gi, "-")}-grades.csv`,
+    rows.map((r) => r.map(csvEscape).join(",")).join("\r\n"), "text/csv");
 }
 
-// ---------------------------------------------------------------- access
+// ----------------------------------------------------------------- access
 async function viewAccess(main) {
   main.append(h("div.card-head", h("h1", "Access"), null));
   const emailI = h("input.input", { type: "email", placeholder: "colleague@university.edu" });
   const list = h("div");
   main.append(
-    h("div.card", h("h3", "Promote a professor"),
-      h("p.help", "The colleague must sign in to this site once first (that creates their account). Then enter their e-mail here."),
+    h("div.card", h("h3", "Add a professor"),
+      h("p.help", "They must sign in to this site once first — that creates their account. Then enter their e-mail here."),
       h("form.row", { onsubmit: async (e) => {
         e.preventDefault();
-        const em = emailI.value.trim().toLowerCase(); if (!em) return;
-        try {
-          const snap = await getDocs(query(collection(db, "users"), where("email", "==", em)));
-          if (snap.empty) return toast("No account with that e-mail has signed in yet.", "warn", 6000);
-          await updateDoc(snap.docs[0].ref, { role: "professor", updatedAt: serverTimestamp() });
-          toast(`${em} is now a professor.`, "success"); emailI.value = ""; load();
-        } catch (e2) { toast(e2.message, "error"); }
-      } }, h("div", { style: { flex: 1 } }, emailI), h("button.btn.btn-primary", { type: "submit" }, "Promote"))),
+        const em = emailI.value.trim().toLowerCase();
+        if (!em) return;
+        try { await setRoleByEmail(em, "professor"); toast(`${em} is now a professor.`, "success"); emailI.value = ""; load(); }
+        catch (e2) { toast(e2.friendly || e2.message, "error", 6000); }
+      } }, h("div", { style: { flex: 1 } }, emailI), h("button.btn.btn-primary", { type: "submit" }, "Add"))),
     h("div.card", h("h3", "Current professors"), list),
   );
   async function load() {
     clear(list);
     try {
-      const snap = await getDocs(query(collection(db, "users"), where("role", "==", "professor")));
-      if (snap.empty) list.append(h("p.muted", "None yet (bootstrap admin is defined in firestore.rules)."));
-      snap.docs.forEach((d) => { const u = d.data(); list.append(h("div.row.between", { style: { padding: ".4rem 0", borderBottom: "1px solid var(--border)" } },
-        h("div", h("strong", u.displayName || u.email), h("div.small.muted", u.email)),
-        d.id !== P.user.uid ? h("button.btn.btn-sm", { onclick: async () => { if (await confirmDialog("Demote?", `${esc(u.email)} will become a student account.`, "Demote")) { await updateDoc(d.ref, { role: "student", updatedAt: serverTimestamp() }); load(); } } }, "Demote") : h("span.badge", "you"))); });
-    } catch (e) { list.append(h("div.form-error", e.message)); }
+      const profs = await listProfessors();
+      if (!profs.length) return list.append(h("p.muted", "None yet."));
+      profs.forEach((u) => list.append(h("div.row.between",
+        { style: { padding: ".4rem 0", borderBottom: "1px solid var(--border)" } },
+        h("div", h("strong", u.display_name || u.email), h("div.small.muted", u.email)),
+        u.id !== P.user.id
+          ? h("button.btn.btn-sm", { onclick: async () => {
+              if (await confirmDialog("Remove?", `${esc(u.email)} will become a student account.`, "Remove")) {
+                try { await setRoleByEmail(u.email, "student"); load(); }
+                catch (e) { toast(e.friendly || e.message, "error"); }
+              }
+            } }, "Remove") : h("span.badge", "you"))));
+    } catch (e) { list.append(h("div.form-error", e.friendly || e.message)); }
   }
   load();
 }
 
-// ---------------------------------------------------------------- help
+// ------------------------------------------------------------------- help
 function viewHelp(main) {
   main.append(h("div.card", { html: `
     <h1>How an exam runs</h1>
     <ol>
       <li><strong>Create</strong> the exam (or import your question list), tick the anti-cheat settings, set the open/close window and <strong>Publish</strong>. You get a 6-character code.</li>
-      <li>Students sign in at the home page and enter the code. They confirm their details, accept the rules and click Start – the server records the start time.</li>
-      <li>Open <strong>Live monitor</strong> during the exam. You see who is online, progress, time left, violations and can <em>Unlock</em>, <em>add time</em>, <em>force-submit</em>, <em>terminate</em> or <em>reset</em> any student.</li>
-      <li>Submissions are auto-graded in your browser (keep the monitor open, or click <em>Grade ungraded</em> later). Essay questions get points from the student drawer.</li>
-      <li>Click <strong>Release scores</strong> when ready. Export a CSV for your records.</li>
+      <li>Students sign in at the home page and enter the code. They confirm their details, accept the rules and click Start — the server records the start time.</li>
+      <li>Open <strong>Live monitor</strong> during the exam. Rows update over a websocket: who is online, progress, time left, violations. You can <em>Unlock</em>, <em>add time</em>, <em>force-submit</em>, <em>terminate</em> or <em>reset</em> any student.</li>
+      <li>Submissions are graded automatically by the database. Essay questions get points from the Review drawer.</li>
+      <li>Click <strong>Release scores</strong> when ready, and export a CSV for your records.</li>
     </ol>
-    <h3>What is enforced by the server (cannot be bypassed by students)</h3>
+    <h3>Enforced by the server — students cannot bypass these</h3>
     <ul>
-      <li>Answer key is never downloadable by students; grades are only writable by you.</li>
-      <li>One attempt per student per exam; identity is the verified sign-in e-mail (optionally restricted to a domain / roster).</li>
-      <li>The clock uses the server's time: start + duration (+ your extra time). Late writes are rejected.</li>
-      <li>Submitted / locked / terminated sessions are frozen.</li>
+      <li>The answer key is readable only by you. Grading happens inside the database, so it is never sent to any browser — not even this one.</li>
+      <li>One attempt per student per exam, tied to a confirmed e-mail address (optionally restricted to a domain or a roster).</li>
+      <li>The clock is the database clock: start + duration + any extra time you grant. Writes after that are rejected, so reloading or changing the device clock achieves nothing.</li>
+      <li>Submitted, locked and terminated attempts are frozen. Violation counters can only go up. Only you can unlock, extend, terminate or reset.</li>
+      <li>Grades are visible to a student only after you release them, and never another student's.</li>
     </ul>
-    <h3>What is recorded as evidence (student-side, therefore advisory)</h3>
-    <p>Tab switches, window blur, fullscreen exits, copy/paste, blocked shortcuts, suspected devtools, reloads, second tabs, heartbeat gaps (offline periods), suspiciously fast completion. Use <em>Analyse risk</em> and the per-student event log; the risk score is a triage aid, not a verdict. Nothing in a browser can see a second device – pair this with a visible proctor or webcam call for high-stakes exams.</p>
+    <h3>Recorded as evidence — advisory, not proof</h3>
+    <p>Tab switches, window blur, fullscreen exits, copy/paste, blocked shortcuts, suspected devtools, reloads, second tabs, offline gaps and suspiciously fast completion. Use <em>Analyse risk</em> and read the per-student event log; the risk score is a triage aid, not a verdict. No browser can see a second device or a person in the room — pair this with a visible proctor for high-stakes exams.</p>
   ` }));
 }

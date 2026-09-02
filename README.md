@@ -1,99 +1,61 @@
 # UnoExamination
 
 A free, serverless, proctored online examination platform that any number of
-professors can share. Static HTML/JS (host it on GitHub Pages) + Firebase
-Authentication + Firestore **security rules** as the backend. No Cloud
-Functions, no paid plan, no server to maintain.
+professors can share. Static HTML/JS (hosted on GitHub Pages) + Supabase
+Postgres with **row level security** as the backend. No server code, no paid
+plan, nothing to maintain.
+
+**Live:** <https://unorfl.github.io/UnoExamination/>
 
 |                     | Professors                                                        | Students                                                   |
 |---------------------|-------------------------------------------------------------------|------------------------------------------------------------|
 | Build exams         | multiple choice, multi-select, true/false, short answer, essay; import the old single-file quiz format or JSON | sign in with Google or e-mail, enter a 6-character code |
 | Anti-cheat          | fullscreen, tab/window/blur, copy-paste, devtools, reload, second-tab, offline detection; configurable strike limit → warn / lock / auto-submit | clear rules page, live strike counter, autosave, resume after crash |
 | Live monitor        | who is online, progress, time left, violations, risk score; unlock, add time, force-submit, terminate, reset | server-side timer — closing the page does not pause it |
-| Grading             | auto-graded in the professor's browser with the private key; manual points for essays; release scores; CSV export | see score & feedback once released |
+| Grading             | auto-graded **inside the database**, so the answer key never reaches any browser; manual points for essays; release scores; CSV export | see score & feedback once released |
 
 Read [`docs/SECURITY.md`](docs/SECURITY.md) for what is enforced by the
 server versus what is only evidence, and [`docs/PRIOR-ART.md`](docs/PRIOR-ART.md)
 for the GitHub projects this design learned from.
 
-## Why Firebase and not "no database at all"?
+## Why a database and not "no database at all"?
 
 A purely static site must ship the answer key to the browser and compute the
 score there, so a student can read the key from *View source* and forge the
 score. Somebody trusted has to hold the key, keep the clock and record the
-result. Firestore's rules engine does exactly that on Google's servers, and
-the Spark (free) plan is enough: 1 GiB storage, 50 000 reads and 20 000 writes
-per day. There is no custom backend code at all.
+result.
 
-## Setup (about 15 minutes)
+Postgres does all three. Row level security decides which rows a request may
+touch, `SECURITY DEFINER` functions decide what it may do, and `grade_session()`
+scores the paper server-side — so the key is never sent anywhere, not even to
+the professor's browser. Supabase's free tier covers it, and there is still no
+backend code to write.
 
-### 1. Create the Firebase project
+## Setup
 
-1. Go to <https://console.firebase.google.com> → **Add project** (Analytics
-   off is fine). Stay on the free **Spark** plan.
-2. **Build → Authentication → Get started.** Enable **Google** and (optionally)
-   **Email/Password**.
-   *Authentication → Settings → Authorized domains*: add the domain you will
-   host on (e.g. `yourname.github.io`).
-3. **Build → Firestore Database → Create database.** Choose a location and
-   **production mode** (rules are deployed in the next step).
-4. **Project settings (gear) → Your apps → Web (</>)**. Register the app; copy
-   the `firebaseConfig` object.
+The live deployment is already configured. To stand up your own copy:
 
-### 2. Configure the site
-
-1. Paste the config into [`js/firebase-config.js`](js/firebase-config.js) and
-   set `siteConfig.institutionName` (optional banner image, colours in
-   `css/style.css`).
-2. Open [`firestore.rules`](firestore.rules) and change the line
-
+1. **Create a Supabase project** at <https://supabase.com> (free tier is fine).
+2. **Apply the schema** — see [`supabase/README.md`](supabase/README.md). Either
+   run `supabase/dump-schema.sql` on an existing copy and paste the output, or
+   use `supabase db dump` / `psql`.
+3. **Set a bootstrap code** so the first professor can promote themself:
+   ```sql
+   insert into private.config (key, value)
+   values ('bootstrap_secret', 'PICK-A-LONG-RANDOM-STRING')
+   on conflict (key) do update set value = excluded.value;
    ```
-   function BOOTSTRAP_ADMIN_EMAIL() { return 'professor@example.edu'; }
-   ```
-
-   to the e-mail of the first professor. That account can promote colleagues
-   later from the dashboard's **Access** tab.
-3. Deploy the rules, either
-   * **Console:** Firestore → *Rules* tab → paste the whole file → Publish, or
-   * **CLI:** `npm i -g firebase-tools && firebase login && firebase use <project-id> && npm run deploy:rules`
-
-### 3. Host the static files
-
-* **GitHub Pages:** push this repository, then *Settings → Pages → Build and
-  deployment → Source: Deploy from a branch* → your branch, folder `/ (root)`.
-  Your site is `https://<user>.github.io/<repo>/`. Commit
-  `js/firebase-config.js` – the Firebase web config is public by design; all
-  security is in the rules.
-
-  This serves the whole repository, so `docs/`, `tests/` and `firestore.rules`
-  are reachable too. That exposes nothing secret (the rules are meant to be
-  auditable and the config is public), but if you would rather publish only the
-  four pages plus `js/` and `css/`, switch *Source* to **GitHub Actions** and
-  add a workflow that stages just those files.
-* **Firebase Hosting (alternative, also free):** `npm run deploy:hosting`.
-* **Locally:** `npm run serve` and open <http://localhost:5000> (add
-  `localhost` to authorized domains).
-
-### 4. Check the setup
-
-Open **`/setup.html`** and sign in. It tests the whole chain and names the exact
-console screen to fix anything that is wrong:
-
-* config pasted, SDK loading, Firestore reachable
-* **whether your rules are actually deployed** — it detects a database left in
-  test mode, which is the mistake that would expose your answer keys
-* e-mail verified, professor role (it self-promotes the bootstrap admin), and a
-  real create-exam / read-key / delete round-trip
-* the authorized-domain reminder for this hostname
-
-Delete `setup.html` and `js/setup.js` once everything passes, or leave them —
-the page grants no access of its own.
-
-### 5. First login
-
-Open `/professor.html`, sign in with the bootstrap e-mail (Google, or e-mail +
-password and click the verification link first). You land on the dashboard.
-Use **Access** to promote other professors after they have signed in once.
+4. **Configure the site** — put your project URL and *publishable* (anon) key in
+   [`js/config.js`](js/config.js). Both are public by design; all security is in
+   the database.
+5. **Authentication → URL Configuration** — set *Site URL* to your site and add
+   `https://your-site/**` to *Redirect URLs*. Enable the Google provider if you
+   want school-account sign-in.
+6. **Host the files.** GitHub Pages: *Settings → Pages → Deploy from a branch*,
+   root. Or `npm run serve` for local use.
+7. **Open `/setup.html`** and sign in. It tests the whole chain and names the
+   exact dashboard screen to fix anything that is wrong — including whether RLS
+   is actually protecting your answer keys.
 
 ## Running an exam
 
@@ -103,7 +65,7 @@ Use **Access** to promote other professors after they have signed in once.
    straight into the Import box — it is converted for you).
 
    > **Keep real answer keys out of git.** Import them through the dashboard so
-   > the key is stored in Firestore where only you can read it. A key committed
+   > the key is stored in the database where only you can read it. A key committed
    > to a public repository is readable by anyone who finds the repo.
 2. **Publish** → you get a code like `K7M2XQ`. Students go to the site, sign
    in, type the code (or use *Copy student link*).
@@ -121,45 +83,48 @@ Use **Access** to promote other professors after they have signed in once.
 | Violation limit / action | After N strikes: *warn* (report only), *lock* (black screen until you unlock), *auto-submit*. |
 | Require fullscreen | Leaving fullscreen is a strike. |
 | Block copy/paste | Paste is a strike; copy/cut/right-click are logged. Turn off for essay-heavy exams if you prefer. |
-| Shuffle questions / options | Deterministic per student; the professor's grader reproduces the same order. |
+| Shuffle questions / options | Deterministic per student, computed in the database, so nobody can reroll for an easier paper. |
 | Questions per student | Random subset from the pool (e.g. 40 of 60), also deterministic per student. |
 | One at a time | Single-question view with a navigator instead of one long page. |
-| Restrict to e-mail domain / roster | Enforced by the rules when a session is created. |
-| Show correct answers | Included in the student's review page once released. |
-| Auto-grade | Grade in the monitor as soon as a student submits. |
+| Restrict to e-mail domain / roster | Checked by `start_exam()` on the server. |
+| Show correct answers | Included in the student's review once scores are released. |
 
-## Data model (Firestore)
+## Data model (Postgres)
 
 ```
-users/{uid}                          role: student | professor
-exams/{CODE}                         title, settings, status, opensAt, closesAt, scoresReleased …
-exams/{CODE}/content/questions       question text/options — NO answers
-exams/{CODE}/private/answerKey       owner-only
-sessions/{CODE}_{uid}                one attempt per student; answers, status, violations, heartbeat
-sessions/{CODE}_{uid}/events/{id}    append-only proctoring log with server timestamps
-grades/{CODE}_{uid}                  written by the professor's browser; visible to the student after release
+profiles         one row per account; role = student | professor
+exams            code (PK), owner, schedule, and every anti-cheat setting
+questions        prompt, options, points  — no answers here
+answer_keys      the key, with NO student-facing RLS policy at all
+sessions         one attempt per student: unique (exam_code, student_id)
+session_events   append-only proctoring log, server-timestamped
+grades           written only by grade_session(); visible to the student after release
 ```
+
+Anything a student may do goes through a function that checks them
+server-side: `start_exam`, `get_paper`, `exam_intro`, `claim_professor`.
 
 ## Development
 
 ```bash
-npm install            # emulator + test tooling (Java required for the Firestore emulator)
-npm test               # unit tests: grading, paper shuffling, import (node --test)
-npm run test:rules     # 19 security-rule tests against the Firestore emulator
-npm run test:e2e       # full browser run-through against the Auth+Firestore emulators
-npm run test:all       # all three
-npm run emulators      # local Auth + Firestore + Hosting emulators
+npm install        # test tooling
+npm test           # unit tests: risk model, importer, editor validation
+npm run test:e2e   # 62 assertions against a real project over the REST API
+npm run serve      # serve the static site on :5000
 ```
 
-The end-to-end test drives real Chromium through the whole lifecycle — publish,
-sit the exam, trigger a violation, submit, auto-grade, grade an essay, release
-scores, lock and unlock a student — and asserts that ten different direct
-Firestore attacks from the student's own browser session are all denied. It
-needs Chromium (`npx playwright install chromium`); in a network-restricted
-sandbox add `E2E_VENDOR_SDK=1` so the Firebase SDK is fetched by node and
-served locally.
+The end-to-end test signs in as a real professor and two real students and
+drives the REST API exactly as the browser does — the whole lifecycle, then
+**18 attacks** from an ordinary student session (read the key by join, restart
+the clock, grant themselves time, write their own grade, promote themselves,
+read another student's work). It needs a service-role key, used only to create,
+confirm and delete throwaway accounts:
 
-The site is plain ES modules loaded from Google's CDN; there is no build step.
+```bash
+SUPABASE_SERVICE_KEY=... npm run test:e2e
+```
+
+The site is plain ES modules; the Supabase SDK loads from a CDN. There is no build step.
 
 ## Import format
 

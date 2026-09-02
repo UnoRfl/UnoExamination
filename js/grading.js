@@ -1,96 +1,11 @@
-// Grading + risk scoring. Pure functions (no Firebase) so they run in the
-// professor's browser AND in unit tests.
+// Risk scoring and question import.
+//
+// Scoring itself lives in Postgres (private.score_one / public.grade_session)
+// so the answer key never reaches a browser. What stays here is the proctoring
+// risk model — advisory, and rendered on the professor's screen — plus the
+// importer that turns an old quiz file into questions and keys.
 
 /** Normalise free-text answers for comparison. */
-export function normalizeText(s, { caseSensitive = false } = {}) {
-  let t = String(s ?? "")
-    .normalize("NFKC")
-    .replace(/[‘’‚‛]/g, "'")
-    .replace(/[“”„‟]/g, '"')
-    .replace(/[–—]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim()
-    // strip surrounding punctuation ("liability." -> "liability")
-    .replace(/^[\s.,;:!?"'()[\]{}]+|[\s.,;:!?"'()[\]{}]+$/g, "");
-  if (!caseSensitive) t = t.toLowerCase();
-  return t;
-}
-
-/**
- * @returns {{earned:number,max:number,correct:boolean|null}}  correct===null => needs manual grading
- */
-export function gradeAnswer(q, key, ans) {
-  const max = Number(q.points) || 1;
-  const none = { earned: 0, max, correct: false };
-  if (q.type === "essay") {
-    return { earned: 0, max, correct: null };
-  }
-  if (ans == null || ans === "" || (Array.isArray(ans) && ans.length === 0)) return none;
-  if (!key) return { earned: 0, max, correct: null };
-
-  switch (q.type) {
-    case "mc": {
-      const ok = Number(ans) === Number(key.correct);
-      return { earned: ok ? max : 0, max, correct: ok };
-    }
-    case "tf": {
-      const a = typeof ans === "string" ? ans === "true" : !!ans;
-      const ok = a === !!key.correct;
-      return { earned: ok ? max : 0, max, correct: ok };
-    }
-    case "multi": {
-      const chosen = new Set((Array.isArray(ans) ? ans : [ans]).map(Number));
-      const correct = new Set((key.correct || []).map(Number));
-      if (key.partialCredit) {
-        // +1 per correct pick, -1 per wrong pick, floored at 0
-        let hits = 0, misses = 0;
-        for (const c of chosen) (correct.has(c) ? hits++ : misses++);
-        const frac = Math.max(0, (hits - misses) / Math.max(1, correct.size));
-        const earned = Math.round(frac * max * 100) / 100;
-        return { earned, max, correct: earned === max ? true : earned > 0 ? "partial" : false };
-      }
-      const ok = chosen.size === correct.size && [...chosen].every((c) => correct.has(c));
-      return { earned: ok ? max : 0, max, correct: ok };
-    }
-    case "text": {
-      const opts = { caseSensitive: !!key.caseSensitive };
-      const given = normalizeText(ans, opts);
-      const ok = (key.accepted || []).some((a) => normalizeText(a, opts) === given && given !== "");
-      return { earned: ok ? max : 0, max, correct: ok };
-    }
-  }
-  return { earned: 0, max, correct: null };
-}
-
-/**
- * Grade a whole session.
- * @param paper     buildPaper() output for this session
- * @param key       answerKey.answers  {qid: {...}}
- * @param answers   session.answers    {qid: value}
- * @param overrides optional manual overrides {qid: {earned, comment}}
- */
-export function gradeSession(paper, key, answers, overrides = {}) {
-  const perQuestion = {};
-  let score = 0, max = 0, needsManual = 0;
-  for (const q of paper) {
-    const auto = gradeAnswer(q, key?.[q.id], answers?.[q.id]);
-    const ov = overrides[q.id];
-    const row = {
-      qid: q.id, type: q.type, max: auto.max,
-      earned: ov && ov.earned != null ? Number(ov.earned) : auto.earned,
-      correct: auto.correct,
-      manual: !!(ov && ov.earned != null),
-      answer: answers?.[q.id] ?? null,
-    };
-    if (ov?.comment) row.comment = ov.comment;
-    if (row.correct === null && !row.manual) needsManual++;
-    perQuestion[q.id] = row;
-    score += row.earned; max += row.max;
-  }
-  score = Math.round(score * 100) / 100;
-  return { score, max, percent: max ? Math.round((score / max) * 1000) / 10 : 0, perQuestion, needsManual };
-}
-
 /** Event types the student client emits, with weights for the risk score. */
 export const EVENT_WEIGHTS = {
   tab_hidden: 3,
@@ -124,11 +39,12 @@ export const STRIKE_EVENTS = new Set([
 ]);
 
 /**
- * @param session   session doc data
- * @param events    array of event docs [{type, at, detail}]
- * @param settings  exam.settings
+ * @param session  a session row (Supabase snake_case, or the older camelCase)
+ * @param events   [{type, at, detail}] in chronological order
+ * @param exam     the exam row; only its duration and violation limit are used
  */
-export function riskScore(session, events = [], settings = {}) {
+export function riskScore(session, events = [], exam = {}) {
+  const settings = exam;
   const reasons = [];
   let score = 0;
   const counts = {};
@@ -152,15 +68,18 @@ export function riskScore(session, events = [], settings = {}) {
     .reduce((s, e) => s + (Number(e.detail?.ms) || 0), 0);
   if (awayMs > 60_000) { score += Math.min(15, awayMs / 60_000 * 3); reasons.push(`away ~${Math.round(awayMs / 1000)}s total`); }
 
-  // Suspiciously fast completion
-  const start = tsMs(session.startedAt), end = tsMs(session.submittedAt);
-  const dur = Number(settings.durationMinutes) || 0;
+  // Suspiciously fast completion. Accept either column style so the model
+  // works against a Supabase row and against the shape the tests build.
+  const start = tsMs(session.startedAt ?? session.started_at);
+  const end   = tsMs(session.submittedAt ?? session.submitted_at);
+  const dur   = Number(settings.duration_minutes ?? settings.durationMinutes) || 0;
   if (end > start && dur) {
     const usedFrac = (end - start) / (dur * 60_000);
-    const total = session.progress?.total || 0, answered = session.progress?.answered || 0;
+    const total    = session.progress?.total    ?? session.total    ?? 0;
+    const answered = session.progress?.answered ?? session.answered ?? 0;
     if (usedFrac < 0.15 && total >= 10 && answered / total > 0.8) { score += 6; reasons.push(`finished in ${Math.round(usedFrac * 100)}% of allotted time`); }
   }
-  if (session.violations >= (settings.maxViolations || 5)) { score += 4; reasons.push("hit violation limit"); }
+  if (session.violations >= (settings.max_violations ?? settings.maxViolations ?? 5)) { score += 4; reasons.push("hit violation limit"); }
 
   score = Math.round(score * 10) / 10;
   const level = score >= 15 ? "high" : score >= 5 ? "medium" : "low";
@@ -169,9 +88,10 @@ export function riskScore(session, events = [], settings = {}) {
 
 function tsMs(ts) {
   if (!ts) return 0;
-  if (typeof ts.toMillis === "function") return ts.toMillis();
+  if (typeof ts.toMillis === "function") return ts.toMillis();  // legacy shape
   if (ts instanceof Date) return ts.getTime();
   if (typeof ts === "number") return ts;
+  if (typeof ts === "string") { const d = Date.parse(ts); return isNaN(d) ? 0 : d; }
   return 0;
 }
 

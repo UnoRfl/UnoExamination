@@ -1,9 +1,9 @@
-// Self-diagnostic for a fresh Firebase project.
+// Self-diagnostic for a fresh Supabase project.
 //
-// Every check answers one question a first-time deployer actually gets wrong:
-// config pasted? Firestore created? rules DEPLOYED (not left in test mode)?
-// sign-in provider enabled? domain authorized? e-mail verified? professor role?
-import { firebaseConfig, siteConfig, isConfigured } from "./firebase-config.js";
+// Each check answers a question a first-time deployer actually gets wrong:
+// config pasted? database reachable? RLS actually on? e-mail confirmed?
+// professor role? can I really create an exam and read its key back?
+import { supabaseConfig, siteConfig, isConfigured } from "./config.js";
 import { $, h, esc, clear } from "./ui.js";
 
 const host = $("#checks");
@@ -18,8 +18,7 @@ function row(icon, title, detail, fix, fixBad) {
     h("div",
       h("div.check-title", title),
       detail ? h("div.check-detail", { html: detail }) : null,
-      fix ? h("div.check-fix", { class: `check-fix${fixBad ? " bad" : ""}`, html: fix }) : null,
-    ));
+      fix ? h("div.check-fix", { class: `check-fix${fixBad ? " bad" : ""}`, html: fix }) : null));
   host.append(r);
   return r;
 }
@@ -33,228 +32,187 @@ async function run() {
   clear(host); clear(actions); summary.hidden = true;
   failed = 0; warned = 0; pending = false;
 
-  // ------------------------------------------------------------ 1. config
+  // -------------------------------------------------------------- 1. config
   if (!isConfigured()) {
-    bad("Firebase config not filled in",
-      "<code>js/firebase-config.js</code> still contains <code>REPLACE_ME</code>.",
-      "Firebase console → gear icon → <b>Project settings</b> → scroll to <b>Your apps</b> → " +
-      "click the web app (or <b>&lt;/&gt;</b> to create one) → copy the <code>firebaseConfig</code> " +
-      "object and paste its values into <code>js/firebase-config.js</code>.");
+    bad("Supabase config not filled in",
+      "<code>js/config.js</code> still has a placeholder.",
+      "Supabase dashboard → <b>Project Settings</b> → <b>API</b> → copy the " +
+      "<b>Project URL</b> and the <b>publishable</b> (anon) key into <code>js/config.js</code>.");
     return finish();
   }
-  ok("Firebase config present", `Project <code>${esc(firebaseConfig.projectId)}</code>`);
+  ok("Supabase config present", `Project <code>${esc(new URL(supabaseConfig.url).hostname.split(".")[0])}</code>`);
 
-  // ------------------------------------------------------------ 2. SDK + init
-  let fb;
-  const initRow = row(BUSY, "Loading the Firebase SDK…");
+  // ------------------------------------------------------------ 2. SDK load
+  let sbmod, db;
+  const loading = row(BUSY, "Loading the Supabase SDK…");
   try {
-    fb = await import("./firebase-init.js");
-    initRow.remove();
-    ok("Firebase SDK loaded and initialised",
-      siteConfig.useEmulators && ["localhost", "127.0.0.1"].includes(location.hostname)
-        ? "Connected to the <b>local emulators</b> (useEmulators is on)." : "Connected to the live project.");
+    sbmod = await import("./supabase.js");
+    db = await import("./db.js");
+    loading.remove();
+    ok("Supabase SDK loaded", "Connected to the project API.");
   } catch (e) {
-    initRow.remove();
-    bad("Firebase SDK failed to load", esc(e.message),
-      "Check your internet connection, and that the page is served over http(s) — " +
-      "opening the files directly with <code>file://</code> does not work. Use " +
-      "<code>npm run serve</code> or GitHub Pages.");
+    loading.remove();
+    bad("Supabase SDK failed to load", esc(e.message),
+      "Check your connection, and serve the page over http(s) — opening the files " +
+      "with <code>file://</code> does not work. Use <code>npm run serve</code> or GitHub Pages.");
     return finish();
   }
+  const { sb } = sbmod;
 
-  // ------------------------------------------------------------ 3. Firestore reachable + rules deployed
-  const dbRow = row(BUSY, "Testing Firestore and your security rules…");
-  let rulesState = "unknown";
+  // ------------------------------------------------- 3. reachable + RLS on
+  const probing = row(BUSY, "Testing the database and its row level security…");
+  let reach = "unknown";
   try {
-    // Nothing may read this path under our rules. permission-denied is the
-    // CORRECT answer and proves the rules are deployed rather than wide open.
-    await fb.getDoc(fb.doc(fb.db, "_setup_probe", "probe"));
-    rulesState = "open";
-  } catch (e) {
-    rulesState = e.code || e.message;
-  }
-  dbRow.remove();
-  if (rulesState === "permission-denied") {
-    ok("Firestore reachable and security rules are deployed",
-      "A locked path correctly returned <code>permission-denied</code>.");
-  } else if (rulesState === "open") {
-    bad("DANGER: your database is wide open",
-      "A path that should be denied to everyone was readable, so your project is still " +
-      "in <b>test mode</b> — any student could read your answer keys and write any grade.",
-      "Deploy the rules NOW: Firebase console → <b>Firestore Database</b> → <b>Rules</b> tab → " +
-      "paste the entire contents of <code>firestore.rules</code> → <b>Publish</b>. " +
-      "Then reload this page.");
-  } else if (/unavailable|offline|network/i.test(rulesState)) {
-    bad("Cannot reach Firestore", `Error: <code>${esc(rulesState)}</code>`,
-      "Have you created the database? Firebase console → <b>Firestore Database</b> → " +
-      "<b>Create database</b> → pick a region → <b>production mode</b>.");
-  } else if (/not-found|NOT_FOUND/i.test(rulesState)) {
-    bad("Firestore database does not exist yet", `Error: <code>${esc(rulesState)}</code>`,
-      "Firebase console → <b>Firestore Database</b> → <b>Create database</b> → " +
-      "choose a region → <b>production mode</b>.");
+    // Nothing may read an answer key without being the exam owner. An empty
+    // result is the CORRECT answer and proves RLS is switched on.
+    const { data, error } = await sb.from("answer_keys").select("question_id").limit(1);
+    reach = error ? (error.message || "error") : (data?.length ? "leaked" : "locked");
+  } catch (e) { reach = e.message; }
+  probing.remove();
+
+  if (reach === "locked") {
+    ok("Database reachable and row level security is on",
+      "A protected table correctly returned nothing.");
+  } else if (reach === "leaked") {
+    bad("DANGER: answer keys are readable",
+      "A signed-out or non-owner request could read <code>answer_keys</code>.",
+      "Re-run the migrations in <code>supabase/migrations/</code> — the RLS policies " +
+      "are missing or were dropped.");
+  } else if (/Failed to fetch|NetworkError/i.test(reach)) {
+    bad("Cannot reach the database", `Error: <code>${esc(reach)}</code>`,
+      "Check the Project URL in <code>js/config.js</code>, and that the project is not paused " +
+      "(Supabase dashboard → the project should say <b>Active</b>).");
+  } else if (/JWT|api key|Invalid/i.test(reach)) {
+    bad("The publishable key is wrong", `Error: <code>${esc(reach)}</code>`,
+      "Supabase dashboard → <b>Project Settings</b> → <b>API</b> → copy the publishable (anon) key again.");
   } else {
-    warn("Unexpected Firestore response", `Got <code>${esc(rulesState)}</code> from the probe read.`,
-      "This is usually still fine, but confirm the rules from <code>firestore.rules</code> are published.");
+    ok("Database reachable", `Protected read returned: <code>${esc(reach)}</code>`);
   }
 
-  // ------------------------------------------------------------ 4. Auth state
-  const user = await new Promise((resolve) => {
-    const un = fb.onAuthStateChanged(fb.auth, (u) => { un(); resolve(u); });
-  });
-
+  // ---------------------------------------------------------- 4. auth state
+  const { data: { user } } = await sb.auth.getUser();
   if (!user) {
     pending = true;
     row(INFO, "Not signed in",
       "Sign in below as the professor account to finish the remaining checks " +
-      "(e-mail verification, professor role, and whether you can create an exam).");
+      "(e-mail confirmation, professor role, and whether you can create an exam).");
     actions.append(
       h("button.btn", { onclick: async () => {
         try {
-          const p = new fb.GoogleAuthProvider();
-          p.setCustomParameters({ prompt: "select_account" });
-          await fb.signInWithPopup(fb.auth, p);
-          run();
-        } catch (e) { showAuthError(e); }
+          const { error } = await sb.auth.signInWithOAuth({
+            provider: "google", options: { redirectTo: location.href.split("#")[0] } });
+          if (error) throw error;
+        } catch (e) { bad("Google sign-in failed", esc(e.message), googleFix(e)); finish(); }
       } }, "Sign in with Google to continue"),
       h("a.btn.btn-ghost", { href: "professor.html" }, "or use the dashboard's sign-in"),
     );
     return finish();
   }
 
-  ok("Signed in", `<code>${esc(user.email)}</code> · uid <code>${esc(user.uid)}</code>`);
-  actions.append(h("button.btn", { onclick: async () => { await fb.signOut(fb.auth); run(); } }, "Sign out"));
+  ok("Signed in", `<code>${esc(user.email)}</code> · id <code>${esc(user.id)}</code>`);
+  actions.append(h("button.btn", { onclick: async () => { await sb.auth.signOut(); run(); } }, "Sign out"));
 
-  if (user.emailVerified) {
-    ok("E-mail address is verified", "Required by the rules before anyone can sit an exam.");
+  if (user.email_confirmed_at || user.confirmed_at) {
+    ok("E-mail address is confirmed", "Required by the server before anyone can sit an exam.");
   } else {
-    bad("E-mail address is NOT verified",
-      "The security rules require a verified e-mail to start an exam session.",
-      "Check your inbox for the verification link. " +
-      "<button class='btn btn-sm' id='resend'>Resend verification e-mail</button>");
-    const btn = $("#resend");
-    btn && btn.addEventListener("click", async () => {
-      const { sendEmailVerification } = await import("https://www.gstatic.com/firebasejs/12.6.0/firebase-auth.js");
-      try { await sendEmailVerification(user); btn.textContent = "Sent — check your inbox"; }
-      catch (e) { btn.textContent = e.message; }
+    bad("E-mail address is NOT confirmed",
+      "<code>start_exam()</code> refuses an unconfirmed address.",
+      "Open the confirmation link we e-mailed you. " +
+      "<button class='btn btn-sm' id='resend'>Resend</button>");
+    $("#resend")?.addEventListener("click", async (e) => {
+      try { await sb.auth.resend({ type: "signup", email: user.email }); e.target.textContent = "Sent — check your inbox"; }
+      catch (err) { e.target.textContent = err.message; }
     });
   }
 
-  // ------------------------------------------------------------ 5. profile + role
+  // ------------------------------------------------------------ 5. profile
   const profRow = row(BUSY, "Checking your account role…");
-  let profile = null, profileErr = null;
-  try {
-    const snap = await fb.getDoc(fb.doc(fb.db, "users", user.uid));
-    if (snap.exists()) profile = snap.data();
-  } catch (e) { profileErr = e.code || e.message; }
+  let profile = null, profErr = null;
+  try { profile = await db.myProfile(); } catch (e) { profErr = e.friendly || e.message; }
   profRow.remove();
 
-  if (profileErr) {
-    bad("Cannot read your own user profile", `Error: <code>${esc(profileErr)}</code>`,
-      "Make sure the rules published in the console are the full contents of " +
-      "<code>firestore.rules</code> from this repository.");
+  if (profErr) {
+    bad("Cannot read your own profile", `Error: <code>${esc(profErr)}</code>`,
+      "The migrations may not all have run. Re-apply <code>supabase/migrations/</code>.");
   } else if (!profile) {
-    row(INFO, "No profile document yet",
-      "It is created automatically the first time you open the dashboard or the home page.");
+    warn("No profile row yet",
+      "It is created by a trigger the first time you sign up.",
+      "Sign out and back in once. If it still does not appear, re-apply the migrations.");
   } else if (profile.role === "professor") {
-    ok("You are a professor", "You can create exams and grade them.");
+    ok("You are a professor", "You can create exams, monitor them and grade.");
   } else {
-    // Is this account the bootstrap admin? Try to claim the role: the rules
-    // allow it only for the e-mail hard-coded in firestore.rules.
-    let claimed = false, claimErr = null;
-    try {
-      await fb.updateDoc(fb.doc(fb.db, "users", user.uid), { role: "professor", updatedAt: fb.serverTimestamp() });
-      claimed = true;
-    } catch (e) { claimErr = e.code || e.message; }
-    if (claimed) {
-      ok("Promoted this account to professor", "Your e-mail matches BOOTSTRAP_ADMIN_EMAIL in the rules.");
-      profile.role = "professor";
-    } else {
-      bad("This account is a student, not a professor",
-        `The rules would not let it self-promote (<code>${esc(claimErr || "denied")}</code>), which means ` +
-        `<code>${esc(user.email)}</code> is not the bootstrap admin e-mail in your deployed rules.`,
-        `Open <code>firestore.rules</code>, set<br>` +
-        `<code>function BOOTSTRAP_ADMIN_EMAIL() { return '${esc(user.email)}'; }</code><br>` +
-        `then re-publish the rules in the console and reload this page. ` +
-        `(Or ask an existing professor to promote you from their <b>Access</b> tab.)`);
-    }
+    pending = true;
+    const codeI = h("input.input", { placeholder: "XXXXX-XXXXX-XXXXX",
+      style: { maxWidth: "260px", textTransform: "uppercase" } });
+    const r = row(INFO, "This account is a student",
+      "Use your one-time bootstrap code to become the first professor.");
+    r.querySelector("div:last-child").append(
+      h("div.row", { style: { marginTop: ".5rem" } }, codeI,
+        h("button.btn.btn-sm.btn-primary", { onclick: async () => {
+          try { await db.claimProfessor(codeI.value.trim().toUpperCase()); run(); }
+          catch (e) { alert(e.friendly || e.message); }
+        } }, "Become professor")));
   }
 
-  // ------------------------------------------------------------ 6. can we actually create an exam?
+  // ------------------------------------------- 6. can I really run an exam?
   if (profile?.role === "professor") {
-    const wRow = row(BUSY, "Testing that you can create and delete an exam…");
+    const wRow = row(BUSY, "Testing that you can create an exam and read its key back…");
     const code = "SETUP" + Math.floor(Math.random() * 10);
-    let writeErr = null;
+    let wErr = null;
     try {
-      const now = new Date();
-      await fb.setDoc(fb.doc(fb.db, "exams", code), {
-        ownerUid: user.uid, ownerName: "setup check", title: "Setup check (safe to ignore)", course: "",
-        instructions: "", status: "draft", opensAt: fb.Timestamp.fromDate(now),
-        closesAt: fb.Timestamp.fromDate(new Date(Date.now() + 3600_000)), scoresReleased: false,
-        questionCount: 0, totalPoints: 0,
-        settings: { durationMinutes: 1, maxViolations: 5, violationAction: "lock", allowedDomain: "", roster: [] },
-        createdAt: fb.serverTimestamp(), updatedAt: fb.serverTimestamp(),
+      await db.saveExam({
+        code, owner_id: user.id, owner_name: "setup check", title: "Setup check (safe to ignore)",
+        status: "draft", opens_at: new Date().toISOString(),
+        closes_at: new Date(Date.now() + 3600_000).toISOString(),
+        duration_minutes: 1, question_count: 1, total_points: 1,
       });
-      await fb.setDoc(fb.doc(fb.db, "exams", code, "private", "answerKey"), { answers: {} });
-      const back = await fb.getDoc(fb.doc(fb.db, "exams", code, "private", "answerKey"));
-      if (!back.exists()) throw new Error("answer key did not come back");
-      await fb.deleteDoc(fb.doc(fb.db, "exams", code, "private", "answerKey"));
-      await fb.deleteDoc(fb.doc(fb.db, "exams", code));
-    } catch (e) { writeErr = e.code || e.message; }
+      await db.replaceQuestions(code, [{
+        type: "mc", prompt: "probe", options: ["a", "b"], points: 1, key: { correct: 1 },
+      }]);
+      const back = await db.examQuestionsWithKeys(code);
+      if (!back.length || back[0].key?.correct !== 1) throw new Error("the answer key did not come back");
+      await db.deleteExam(code);
+    } catch (e) { wErr = e.friendly || e.message; try { await db.deleteExam(code); } catch {} }
     wRow.remove();
-    if (!writeErr) ok("Exam create / read-key / delete all work", "Everything is wired up correctly.");
-    else bad("Could not create a test exam", `Error: <code>${esc(writeErr)}</code>`,
-      "The published rules are probably an older or partial copy. Re-paste the whole " +
-      "<code>firestore.rules</code> file in the console and publish again.");
+    if (!wErr) ok("Exam create → read key → delete all work", "Everything is wired up correctly.");
+    else bad("Could not run the exam round-trip", `Error: <code>${esc(wErr)}</code>`,
+      "Re-apply the migrations in <code>supabase/migrations/</code>, then reload this page.");
   }
 
-  // ------------------------------------------------------------ 7. authorized domain reminder
-  row(INFO, "Authorized domains",
-    `This page is served from <code>${esc(location.hostname)}</code>. Firebase Auth only allows ` +
-    `sign-in from domains you have listed.`,
-    "If sign-in fails with <code>auth/unauthorized-domain</code>: Firebase console → " +
-    "<b>Authentication</b> → <b>Settings</b> → <b>Authorized domains</b> → <b>Add domain</b> → " +
-    `<code>${esc(location.hostname)}</code>.`);
+  // --------------------------------------------------- 7. redirect reminder
+  row(INFO, "Sign-in redirect URLs",
+    `This page is served from <code>${esc(location.origin)}</code>. Supabase only returns users ` +
+    `to URLs you have listed.`,
+    "If Google sign-in bounces or errors: Supabase dashboard → <b>Authentication</b> → " +
+    `<b>URL Configuration</b> → add <code>${esc(location.origin)}/**</code> to <b>Redirect URLs</b> ` +
+    `and set <b>Site URL</b> to <code>${esc(location.origin)}</code>.`);
 
   finish();
 }
 
-function showAuthError(e) {
-  const code = e?.code || "";
-  let fix = esc(e?.message || String(e));
-  if (code === "auth/unauthorized-domain") {
-    fix = `Firebase console → <b>Authentication</b> → <b>Settings</b> → <b>Authorized domains</b> → ` +
-          `add <code>${esc(location.hostname)}</code>.`;
-  } else if (code === "auth/operation-not-allowed" || code === "auth/configuration-not-found") {
-    fix = "Google sign-in is not enabled yet: Firebase console → <b>Authentication</b> → " +
-          "<b>Sign-in method</b> → <b>Google</b> → enable it and save.";
-  } else if (code === "auth/popup-blocked") {
-    fix = "Your browser blocked the popup. Allow popups for this site and try again.";
+function googleFix(e) {
+  const m = (e?.message || "").toLowerCase();
+  if (m.includes("provider is not enabled")) {
+    return "Enable it: Supabase dashboard → <b>Authentication</b> → <b>Sign In / Providers</b> → <b>Google</b>.";
   }
-  bad(`Sign-in failed (${esc(code || "error")})`, "", fix);
-  finish();
+  return `Supabase dashboard → <b>Authentication</b> → <b>URL Configuration</b> → add <code>${esc(location.origin)}/**</code>.`;
 }
 
 function finish() {
   summary.hidden = false;
   clear(summary);
   if (pending && failed === 0) {
-    summary.append(
-      h("h2", "Looking good so far"),
-      h("p", "Sign in above as your professor account to finish the remaining checks — " +
-             "e-mail verification, the professor role, and whether you can actually create an exam."),
-    );
+    summary.append(h("h2", "Looking good so far"),
+      h("p", "Finish the step above to complete the remaining checks."));
   } else if (failed === 0 && warned === 0) {
-    summary.append(
-      h("h2", { style: { color: "var(--success)" } }, "Everything passes — you are ready"),
+    summary.append(h("h2", { style: { color: "var(--success)" } }, "Everything passes — you are ready"),
       h("p", "Open the ", h("a", { href: "professor.html" }, "professor dashboard"),
-        ", create an exam, and share the code with your students."),
-    );
+        ", create an exam, and share the code with your students."));
   } else {
     summary.append(
       h("h2", { style: { color: failed ? "var(--danger)" : "var(--warn)" } },
         failed ? `${failed} thing${failed === 1 ? "" : "s"} still to fix` : `${warned} warning${warned === 1 ? "" : "s"}`),
-      h("p.muted", "Fix the items marked above, then click ", h("b", "Run checks again"), "."),
-    );
+      h("p.muted", "Fix the items marked above, then click ", h("b", "Run checks again"), "."));
   }
 }
 

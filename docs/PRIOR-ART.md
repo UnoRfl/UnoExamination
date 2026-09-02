@@ -1,4 +1,4 @@
-# Prior art: online exam / quiz projects on GitHub Pages & Firebase
+# Prior art: online exam / quiz projects on GitHub Pages, Firebase and Supabase
 
 Research done while designing UnoExamination (September 2026). Only public
 README / rules files were consulted; nothing below was run.
@@ -36,12 +36,21 @@ No public project was found that combines **GitHub Pages hosting + Firebase + br
 - Firestore `request.time` for trustworthy start/end timestamps.
 - Grading in a trusted context. Zedexams uses a Cloud Function; **UnoExamination uses the professor's own authenticated browser instead**, which is compatible with rules-only Firestore (`allow read: if isOwner()` on the key) and needs no paid plan. This pattern was not found in any public project.
 
+## What this project ended up doing
+
+The first version of UnoExamination used the Zedexams pattern on Firestore:
+key in an owner-only document, grading in the professor's browser. It then
+moved to Supabase Postgres, which allows something none of the projects above
+manage without a paid function runtime — **grading inside the database**. A
+`SECURITY DEFINER` function reads the key server-side and returns only the
+score, so the key never reaches a browser at all, professor's included.
+
 ## Lessons applied in UnoExamination
 
-1. Answer key lives in `exams/{code}/private/answerKey`, readable only by the exam owner.
+1. The answer key lives in `answer_keys`, which has no student-facing RLS policy at all.
 2. Sessions are write-once for identity/start fields; students can only add answers, heartbeats and violations, and only until the server-side deadline.
-3. Grades are a separate collection written only by the professor and readable by the student only after release.
+3. Grades are a separate table, written only by `grade_session()` and readable by the student only after release.
 4. `visibilitychange` / `blur` / `fullscreenchange` etc. are recorded as timestamped evidence with a configurable strike policy (warn / lock / auto-submit); the professor decides.
 5. DevTools detection and shortcut blocking are kept only as friction and evidence, never as security.
-6. Questions are served per attempt (deterministic shuffle and optional random subset) and only after the session exists.
-7. GitHub Pages hosting is fine; the Firebase web config is public by design, and Auth authorized domains plus the rules are the actual perimeter.
+6. Questions are served per attempt by `get_paper()` — a deterministic shuffle computed in the database, so a student cannot reroll for an easier subset — and only after their session exists.
+7. GitHub Pages hosting is fine; the publishable key is public by design, and RLS plus the auth redirect list are the actual perimeter.

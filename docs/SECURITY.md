@@ -1,10 +1,11 @@
 # Security model & threat analysis
 
-UnoExamination has **no server of its own**. The static pages can be hosted
-anywhere (GitHub Pages, Firebase Hosting, Netlify…). All state lives in
-Firestore, and all enforcement is done by `firestore.rules`, which Google
-evaluates on their servers on every read and write. Understanding what that
-can and cannot guarantee is the point of this document.
+UnoExamination has **no server code of its own**. The static pages can be
+hosted anywhere (GitHub Pages, Netlify, Supabase Storage…). All state lives in
+Supabase Postgres, and all enforcement is done by row level security, by
+`BEFORE` triggers and by `SECURITY DEFINER` functions, evaluated on Supabase's
+servers on every request. Understanding what that can and cannot guarantee is
+the point of this document.
 
 ## 1. Why a purely static site cannot be made cheat-proof
 
@@ -19,32 +20,34 @@ amount of client-side JavaScript can fix:
 | "Terminated" is just DOM manipulation | Reload the page and you have five fresh strikes. |
 
 Any design that keeps *all* data on the client inherits these. Some trusted
-party must hold the key, keep time, and record the score. Firestore's rules
-engine is that trusted party here, and it is free.
+party must hold the key, keep time, and record the score. Postgres is that
+trusted party here — and because grading is a database function, the key never
+reaches *any* browser, including the professor's.
 
-## 2. What the server (Firestore rules) enforces
+## 2. What the server (Postgres) enforces
 
 These hold even against a student who has fully reverse-engineered the client
-and talks to Firestore directly with their own credentials.
+and talks to the REST API directly with their own credentials. Every row is
+verified by `tests/e2e/api-flow.mjs`, which attacks the live project as an
+ordinary signed-in student.
 
 | Guarantee | Mechanism |
 |---|---|
-| Students never see the answer key | `exams/{code}/private/answerKey` is readable only when `ownerUid == request.auth.uid` and the account has the professor role. |
-| Students never see questions before starting | `exams/{code}/content/questions` is readable only if `sessions/{code}_{uid}` exists, and creating that document starts the clock. |
-| Exactly one attempt per student | The session id is `{code}_{uid}`; the create rule requires that exact id and `create` fails if it exists. Only the exam owner can delete it (reset). |
-| Identity | Firebase Auth. Session e-mail must equal the token e-mail and `email_verified` must be true, so nobody can register someone else's address. Optional domain and roster restrictions are checked in the rule, not the UI. |
-| Trusted start time | `startedAt == request.time` (server clock) is required on create; `startedAt` can never be updated by the student. |
-| Trusted deadline | Every student write must satisfy `request.time <= startedAt + duration + extraMinutes + 90s` **and** `request.time <= exam.closesAt + 90s`. After that the session is frozen with whatever was saved. |
-| Frozen after submit / lock | Student updates require `status == 'in_progress'`. Moving to `submitted` or `locked` requires `submittedAt`/`lockedAt == request.time`, so timestamps cannot be back-dated. Only the owner can move `locked -> in_progress`. |
-| Violation count only rises | `request.resource.data.violations >= resource.data.violations`. |
-| Whitelisted fields | Students may only change `answers, lastSavedAt, heartbeatAt, violations, status, submittedAt, lockedAt, clientId, progress`. Everything else (uid, examCode, extraMinutes, grade…) is immutable from the student side. |
-| Events are append-only with server time | `events/{id}` create requires `at == request.time`; update is denied for everyone; delete only by the owner. |
-| Grades are professor-only | `grades/{sid}` writable only by the exam owner with `gradedBy == uid`; readable by the student only when `exam.scoresReleased == true`, and never another student's. |
-| Isolation between professors | Every owner check compares `exam.ownerUid` to the caller; professors cannot list or read each other's exams, sessions, keys or grades. |
-| Role escalation | A user may create their profile only with `role == 'student'`. Only an existing professor may change someone else's role. The single bootstrap professor is an e-mail hard-coded in the rules and must be verified. |
-
-`tests/rules/firestore.rules.test.js` exercises all of the above against the
-Firestore emulator (`npm run test:rules`).
+| Students never see the answer key | `answer_keys` has RLS enabled and **no student policy at all**; the only policy requires `private.owns_exam()`. Reading it by join, by subquery or directly returns zero rows. |
+| Nobody's browser sees the key — not even the professor's | Grading is `public.grade_session()`, a `SECURITY DEFINER` function. The key is read inside the database and only the score comes back. |
+| Students never see questions before starting | The `questions` select policy requires `private.has_session()`, and creating that session is what starts the clock. |
+| Exactly one attempt per student | `unique (exam_code, student_id)` on `sessions`. `start_exam()` returns the existing session instead of creating a second one. Only the owner may delete it (reset). |
+| Identity | Supabase Auth. `start_exam()` refuses an unconfirmed address, and the optional domain / roster check runs in `private.student_allowed()`, not in the UI. |
+| Trusted start time | A `before insert` trigger overwrites `started_at` with `now()`. A `before update` trigger makes it immutable thereafter. |
+| Trusted deadline | Every student write is gated by `private.session_writable()`: `now() <= started_at + duration + extra_minutes + 90s` and `now() <= closes_at + 90s`. Changing the device clock, reloading, or replaying a request achieves nothing. |
+| Frozen after submit / lock | The update trigger allows only `in_progress → submitted \| locked`, and stamps the timestamp from the server so it cannot be back-dated. Only the owner can move `locked → in_progress`. |
+| Violation counts only rise | The trigger rejects any update where `violations` decreases. |
+| Column-level immutability | The trigger rejects student changes to `extra_minutes`, `flagged`, `reviewed`, `note`, `student_id`, `exam_code`, `started_at`. It also rejects a *professor* changing `answers`. |
+| Events are append-only | Insert policy requires owning the session; the timestamp is stamped by a trigger; there is **no update policy**; delete is owner-only. |
+| Grades are professor-only | The write policy requires `private.owns_exam()` and `graded_by = auth.uid()`. A student sees their own grade only when `exams.scores_released` is true, and never another student's. |
+| Role escalation | A trigger forces `role = 'student'` on self-insert, forbids changing your own role, and lets a professor change only the `role` column of another account — nothing else. |
+| Isolation between professors | Every owner check compares `exams.owner_id` to `auth.uid()`. Professors cannot read each other's exams, keys, sessions or grades. |
+| The bootstrap secret | Lives in `private.config`, which has no grants to `anon` or `authenticated`. Reading it from the API is denied at the schema level. |
 
 ## 3. What is only *evidence* (client-side signals)
 
@@ -93,33 +96,34 @@ positives irreversibly; the professor can unlock, add time, or terminate.
 
 ## 5. Hardening the deployment
 
-1. **Rules first.** Never switch Firestore to "test mode". Deploy
-   `firestore.rules` before sharing any exam code.
-2. **Auth providers.** Prefer Google sign-in restricted to the school's
-   domain (`allowedDomain` per exam) so every identity is a real school
-   account. If you enable e-mail/password, keep e-mail verification (it is
-   required by the rules).
-3. **Authorized domains.** In Firebase Console → Authentication → Settings →
-   Authorized domains, list only your hosting domains (e.g. `you.github.io`).
-4. **API key restrictions** (optional). In Google Cloud Console → Credentials
-   you can restrict the web API key to your site's HTTP referrers. The key is
-   not a secret, but this reduces abuse of your free quota.
-5. **App Check** (optional, still free). Enabling Firebase App Check with
-   reCAPTCHA v3 for Firestore blocks scripts that talk to your database from
-   outside a real browser session on your site. It raises the bar for
-   "fake heartbeats from a script" style tampering.
-6. **Quota.** The Spark plan gives 50k reads / 20k writes per day. A 60-student
-   exam of 60 minutes uses roughly 60 × (150 heartbeats + ~120 autosaves +
-   events) ≈ 20k writes and far fewer reads. For very large cohorts on one
-   day, raise the heartbeat interval in `js/student.js` or split exams across
-   days. Firebase shows usage in the console.
-7. **Backups.** Export grades to CSV from the dashboard after each exam.
+1. **Never disable RLS.** Every table has it enabled. `/setup.html` probes
+   `answer_keys` on load and reports loudly if it is ever readable — that check
+   exists because a disabled policy looks completely normal from the UI.
+2. **Auth providers.** Prefer Google sign-in and set `allowed_domain` per exam,
+   so every identity is a real school account. With e-mail/password, keep
+   "Confirm email" on — `start_exam()` refuses an unconfirmed address.
+3. **URL configuration.** Supabase dashboard → Authentication → URL
+   Configuration: set *Site URL* to your site and list only your own origins
+   under *Redirect URLs*.
+4. **Keep the service_role key out of the browser.** It bypasses RLS entirely.
+   It belongs in your terminal (for `npm run test:e2e`) and nowhere else. The
+   *publishable* key in `js/config.js` is the one that is safe to ship.
+5. **Rotate the bootstrap code.** `claim_professor()` deletes it after a single
+   use. If you ever re-seed `private.config`, use a long random value.
+6. **Quota.** The free tier gives 500 MB of database and 5 GB egress. A
+   60-student, one-hour exam writes roughly 60 × (150 heartbeats + ~120
+   autosaves + events) rows-worth of updates — comfortably inside it. If you
+   run several large exams a day, raise the heartbeat interval in
+   `js/student.js` (`startHeartbeat`, currently 25 s).
+7. **Backups.** Export grades to CSV after each exam, and take a
+   `supabase db dump` before schema changes.
 
 ## 6. Privacy
 
 The platform stores: name, e-mail, student id, section, answers, timestamps,
 violation events, and a browser fingerprint (user agent, platform, language,
-screen size, time zone). It does **not** access camera, microphone, or the
-public IP address. Tell students what is recorded (the pre-exam rules page
-does) and follow your institution's data policy for retention. Deleting an
-exam from the dashboard deletes all its sessions, events and grades.
+screen size, time zone). It does **not** access camera or microphone. Supabase
+sees the request IP as any web host would, but the application never reads or
+stores it. Tell students what is recorded (the pre-exam rules page
+does) and follow your institution's data policy for retention. Deleting an exam
+deletes all its sessions, events and grades with it (`on delete cascade`).
