@@ -67,7 +67,22 @@ per day. There is no custom backend code at all.
 * **Locally:** `npm run serve` and open <http://localhost:5000> (add
   `localhost` to authorized domains).
 
-### 4. First login
+### 4. Check the setup
+
+Open **`/setup.html`** and sign in. It tests the whole chain and names the exact
+console screen to fix anything that is wrong:
+
+* config pasted, SDK loading, Firestore reachable
+* **whether your rules are actually deployed** — it detects a database left in
+  test mode, which is the mistake that would expose your answer keys
+* e-mail verified, professor role (it self-promotes the bootstrap admin), and a
+  real create-exam / read-key / delete round-trip
+* the authorized-domain reminder for this hostname
+
+Delete `setup.html` and `js/setup.js` once everything passes, or leave them —
+the page grants no access of its own.
+
+### 5. First login
 
 Open `/professor.html`, sign in with the bootstrap e-mail (Google, or e-mail +
 password and click the verification link first). You land on the dashboard.

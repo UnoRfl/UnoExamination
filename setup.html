@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Setup check · UnoExamination</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%237a0d1f'/><text x='50' y='68' font-size='56' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'>U</text></svg>">
+<style>
+  .check-row { display: grid; grid-template-columns: 28px 1fr; gap: .7rem; padding: .7rem 0; border-bottom: 1px solid var(--border); align-items: start; }
+  .check-row:last-child { border-bottom: 0; }
+  .check-icon { font-size: 1.1rem; line-height: 1.4; text-align: center; }
+  .check-title { font-weight: 600; }
+  .check-detail { font-size: .87rem; color: var(--muted); margin-top: .15rem; }
+  .check-detail code { background: var(--surface-2); padding: 0 .3em; border-radius: 4px; word-break: break-all; }
+  .check-fix { font-size: .87rem; margin-top: .35rem; padding: .5rem .7rem; border-radius: 8px; background: var(--warn-soft); color: var(--warn); }
+  .check-fix.bad { background: var(--danger-soft); color: var(--danger); }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="./"><span class="logo">U</span><span>UnoExamination</span> <span class="badge">Setup check</span></a>
+  <div class="row"><a class="btn btn-sm" href="professor.html">Professor dashboard</a></div>
+</header>
+
+<main class="container narrow">
+  <div class="card">
+    <h1>Setup check</h1>
+    <p class="muted">This page tests your Firebase connection and tells you exactly what is still
+      missing. Open it after pasting your config and deploying the rules. It is safe to leave
+      deployed, but you can delete <code>setup.html</code> and <code>js/setup.js</code> once
+      everything passes.</p>
+    <div id="checks"></div>
+    <div class="row" style="margin-top:1rem">
+      <button class="btn btn-primary" id="rerun">Run checks again</button>
+      <div id="authActions" class="row"></div>
+    </div>
+  </div>
+  <div class="card" id="summary" hidden></div>
+</main>
+<script type="module" src="js/setup.js"></script>
+</body>
+</html>
