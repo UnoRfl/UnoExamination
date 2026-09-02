@@ -18,6 +18,31 @@
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
+  <script>
+    // If the page's module graph fails to load (offline, blocked script, bad
+    // deploy), the static markup below would sit there forever saying
+    // "Loading…". This says what actually happened instead.
+    window.__unoBooted = false;
+    window.addEventListener("error", function (e) {
+      if (e && e.target && e.target.tagName === "SCRIPT") showBootError("A script failed to load: " + (e.target.src || "inline"));
+    }, true);
+    setTimeout(function () {
+      if (!window.__unoBooted) showBootError("The page scripts did not finish loading.");
+    }, 8000);
+    function showBootError(detail) {
+      if (document.getElementById("bootError")) return;
+      var host = document.getElementById("app") || document.body;
+      var d = document.createElement("div");
+      d.id = "bootError";
+      d.style.cssText = "max-width:680px;margin:2rem auto;padding:1.2rem;border-radius:12px;background:#fdecec;color:#8a1f1f;font:14px/1.5 system-ui,sans-serif";
+      d.innerHTML = "<strong>This page could not start.</strong><p style='margin:.6rem 0'>" + detail +
+        "</p><p style='margin:.6rem 0'>Reload the page. If it keeps happening, your network may be blocking " +
+        "part of the site &mdash; try another connection, or tell your professor.</p>" +
+        "<button style='padding:.5rem 1rem;border-radius:8px;border:1px solid #8a1f1f;background:#fff;color:#8a1f1f;cursor:pointer' onclick='location.reload()'>Reload</button>";
+      host.innerHTML = "";
+      host.appendChild(d);
+    }
+  </script>
 </head>
 <body>
 <header class="topbar">

@@ -3,6 +3,9 @@ import { watchAuth, renderAuthPanel, logout, isVerified, resendVerification } fr
 import { myProfile, updateMyProfile, mySessions, myGrades } from "./db.js";
 import { $, h, esc, toast, fmtDate, clear } from "./ui.js";
 
+// tells the boot watchdog in the HTML that the module graph loaded
+window.__unoBooted = true;
+
 const app = $("#app");
 $("#brandName").textContent = siteConfig.institutionName;
 document.title = siteConfig.institutionName;

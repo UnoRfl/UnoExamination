@@ -14,6 +14,9 @@ import { STRIKE_EVENTS } from "./grading.js";
 import { Proctor, detectReload, clientFingerprint } from "./proctor.js";
 import { $, $$, h, esc, toast, dialog, confirmDialog, mmss, fmtDate, clear, qs, randomId } from "./ui.js";
 
+// tells the boot watchdog in the HTML that the module graph loaded
+window.__unoBooted = true;
+
 const app = $("#app");
 const CODE = (qs("code") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 const REVIEW = qs("review") === "1";

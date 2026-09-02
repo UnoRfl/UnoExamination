@@ -6,6 +6,9 @@
 import { supabaseConfig, siteConfig, isConfigured } from "./config.js";
 import { $, h, esc, clear } from "./ui.js";
 
+// tells the boot watchdog in the HTML that the module graph loaded
+window.__unoBooted = true;
+
 const host = $("#checks");
 const summary = $("#summary");
 const actions = $("#authActions");

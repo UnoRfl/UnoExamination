@@ -19,6 +19,9 @@ import {
   toDate, toLocalInput, clear, downloadText, csvEscape, examCode, randomId,
 } from "./ui.js";
 
+// tells the boot watchdog in the HTML that the module graph loaded
+window.__unoBooted = true;
+
 const app = $("#app");
 $("#brandName").textContent = siteConfig.institutionName;
 

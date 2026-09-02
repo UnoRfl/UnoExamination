@@ -1,6 +1,10 @@
 // Single place that loads the Supabase SDK and exposes the client.
-// No build step: the SDK is an ES module from jsDelivr.
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/+esm";
+//
+// The SDK is vendored into js/vendor/ rather than pulled from a CDN. The CDN
+// build fans out into six more requests, and any one of them failing on a
+// school or campus network leaves the page dead with no explanation. One local
+// file removes that whole class of failure. Regenerate with `npm run vendor`.
+import { createClient } from "./vendor/supabase-js.js";
 import { supabaseConfig, isConfigured } from "./config.js";
 
 if (!isConfigured()) {
