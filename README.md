@@ -59,10 +59,17 @@ per day. There is no custom backend code at all.
 
 ### 3. Host the static files
 
-* **GitHub Pages:** push this repository, then *Settings → Pages → Deploy from
-  branch* (root). Your site is `https://<user>.github.io/<repo>/`. Commit
+* **GitHub Pages:** push this repository, then *Settings → Pages → Build and
+  deployment → Source: Deploy from a branch* → your branch, folder `/ (root)`.
+  Your site is `https://<user>.github.io/<repo>/`. Commit
   `js/firebase-config.js` – the Firebase web config is public by design; all
   security is in the rules.
+
+  This serves the whole repository, so `docs/`, `tests/` and `firestore.rules`
+  are reachable too. That exposes nothing secret (the rules are meant to be
+  auditable and the config is public), but if you would rather publish only the
+  four pages plus `js/` and `css/`, switch *Source* to **GitHub Actions** and
+  add a workflow that stages just those files.
 * **Firebase Hosting (alternative, also free):** `npm run deploy:hosting`.
 * **Locally:** `npm run serve` and open <http://localhost:5000> (add
   `localhost` to authorized domains).
