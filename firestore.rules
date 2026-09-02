@@ -1,0 +1,269 @@
+rules_version = '2';
+
+// ============================================================================
+//  UnoExamination – Firestore Security Rules
+//  ---------------------------------------------------------------------------
+//  These rules ARE the backend. There is no Cloud Function and no custom
+//  server, so every guarantee the platform makes is enforced here:
+//
+//    * students can never read an answer key
+//    * students can never read another student's session / grade
+//    * a student gets exactly one session per exam (deterministic doc id)
+//    * the exam clock is Firestore's server clock (request.time), not the
+//      student's device clock
+//    * once a session is submitted / locked / past its deadline it is frozen
+//    * only the exam owner (a professor) can grade, unlock, extend or reset
+//    * violation counters can only go UP from the student side
+//
+//  BEFORE DEPLOYING: put your own e-mail in BOOTSTRAP_ADMIN_EMAIL below.
+//  That account becomes the first professor and can promote colleagues from
+//  the dashboard ("Access" tab). Any number of professors can share one
+//  deployment; each only sees their own exams.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ------------------------------------------------------------------ //
+    //  >>>>>  EDIT THIS LINE  <<<<<
+    // ------------------------------------------------------------------ //
+    function BOOTSTRAP_ADMIN_EMAIL() { return 'professor@example.edu'; }
+
+    // ---------------------------------------------------------------- helpers
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function email() { return request.auth.token.get('email', '').lower(); }
+    function emailVerified() {
+      return signedIn() && request.auth.token.get('email_verified', false) == true;
+    }
+    function isBootstrapAdmin() {
+      return emailVerified() && email() == BOOTSTRAP_ADMIN_EMAIL().lower();
+    }
+    function userPath() { return /databases/$(db)/documents/users/$(uid()); }
+    function isProfessor() {
+      return signedIn() && (
+        isBootstrapAdmin() ||
+        (exists(userPath()) && get(userPath()).data.role == 'professor')
+      );
+    }
+    function examPath(code) { return /databases/$(db)/documents/exams/$(code); }
+    function exam(code) { return get(examPath(code)).data; }
+    function ownsExam(code) {
+      return isProfessor() && exists(examPath(code)) && exam(code).ownerUid == uid();
+    }
+    // Same check but against the state AFTER the current batched write, so
+    // the exam document and its subcollections can be created in one batch.
+    function ownsExamAfter(code) {
+      return isProfessor() && getAfter(examPath(code)).data.ownerUid == uid();
+    }
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function examIsOpen(e) {
+      return e.status == 'open'
+          && request.time >= e.opensAt
+          && request.time <= e.closesAt;
+    }
+    // Roster / domain restrictions configured by the professor
+    function studentAllowed(e) {
+      return (e.settings.allowedDomain == '' ||
+              email().split('@')[1] == e.settings.allowedDomain.lower())
+          && (e.settings.roster.size() == 0 || email() in e.settings.roster);
+    }
+    // sid is "<EXAMCODE>_<uid>"  (exam codes never contain '_')
+    function sidCode(sid) { return sid.split('_')[0]; }
+    function sidUid(sid)  { return sid.split('_')[1]; }
+    function minutesAllowed(s, e) {
+      return e.settings.durationMinutes + s.get('extraMinutes', 0);
+    }
+    // Hard deadline for student writes: start + duration (+ extra time) + 90 s
+    // grace so the final autosave / submit racing the timer is not lost.
+    function withinDeadline(s, e) {
+      return request.time <= s.startedAt
+                             + duration.value(minutesAllowed(s, e), 'm')
+                             + duration.value(90, 's')
+          && request.time <= e.closesAt + duration.value(90, 's');
+    }
+
+    // ==================================================================
+    //  users/{uid}
+    // ==================================================================
+    match /users/{userId} {
+      allow get:  if signedIn() && (uid() == userId || isProfessor());
+      allow list: if isProfessor();
+
+      // A user creates their own profile. Role is 'student' unless this is the
+      // bootstrap admin, who may create themself as 'professor'.
+      allow create: if signedIn() && uid() == userId
+        && request.resource.data.email == email()
+        && request.resource.data.keys().hasOnly(
+             ['email', 'displayName', 'photoURL', 'role', 'studentId', 'section', 'createdAt'])
+        && (request.resource.data.role == 'student'
+            || (request.resource.data.role == 'professor' && isBootstrapAdmin()));
+
+      allow update: if signedIn() && (
+        // self-service profile edits: never role / email
+        (uid() == userId
+          && !('role' in changed()) && !('email' in changed())
+          && request.resource.data.keys().hasOnly(
+               ['email', 'displayName', 'photoURL', 'role', 'studentId', 'section', 'createdAt', 'updatedAt']))
+        // professors promote / demote colleagues (never themselves)
+        || (isProfessor() && uid() != userId
+          && changed().hasOnly(['role', 'updatedAt'])
+          && request.resource.data.role in ['student', 'professor'])
+        // bootstrap admin may promote themself if they signed up as student first
+        || (isBootstrapAdmin() && uid() == userId
+          && changed().hasOnly(['role', 'updatedAt'])
+          && request.resource.data.role == 'professor')
+      );
+      allow delete: if false;
+    }
+
+    // ==================================================================
+    //  exams/{code}      public metadata + settings (NO answers here)
+    //  exams/{code}/content/questions   question text/options (NO answers)
+    //  exams/{code}/private/answerKey   owner-only
+    // ==================================================================
+    match /exams/{code} {
+      function validExam(d) {
+        return d.ownerUid == uid()
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 200
+          && d.status in ['draft', 'open', 'closed']
+          && d.opensAt is timestamp && d.closesAt is timestamp
+          && d.settings is map
+          && d.settings.durationMinutes is int
+          && d.settings.durationMinutes >= 1 && d.settings.durationMinutes <= 600
+          && d.settings.allowedDomain is string
+          && d.settings.roster is list
+          && d.scoresReleased is bool
+          && !('answers' in d) && !('answerKey' in d) && !('questions' in d);
+      }
+
+      // Students: fetch ONE exam by code, only while it is open. Owner: always.
+      // (No 'list' for students -> nobody can enumerate exams.)
+      allow get: if signedIn() && (resource.data.ownerUid == uid() || examIsOpen(resource.data));
+      allow list: if isProfessor() && resource.data.ownerUid == uid();
+
+      allow create: if isProfessor() && validExam(request.resource.data);
+      allow update: if ownsExam(code) && validExam(request.resource.data)
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if ownsExam(code);
+
+      match /content/{doc} {
+        // Question text is only downloadable AFTER the student has started a
+        // session (which starts the server-side clock) - or by the owner.
+        allow get: if ownsExam(code)
+          || (signedIn()
+              && exists(/databases/$(db)/documents/sessions/$(code + '_' + uid())));
+        allow list: if false;
+        allow create, update: if ownsExamAfter(code)
+          && !('answers' in request.resource.data) && !('answerKey' in request.resource.data);
+        allow delete: if ownsExam(code);
+      }
+
+      match /private/{doc} {
+        allow read: if ownsExam(code);
+        allow create, update: if ownsExamAfter(code);
+        allow delete: if ownsExam(code);
+      }
+    }
+
+    // ==================================================================
+    //  sessions/{code}_{uid}     one attempt per student per exam
+    //  sessions/{sid}/events/{id} proctoring event log (append-only)
+    // ==================================================================
+    match /sessions/{sid} {
+      function isOwnSession() { return signedIn() && resource.data.uid == uid(); }
+      function professorOwns() { return ownsExam(resource.data.examCode); }
+
+      // NOTE: get() must not touch resource.data - the client legitimately reads
+      // this path before the session exists ("have I started yet?"), and a
+      // missing document makes resource null. Use the doc id instead.
+      allow get:  if signedIn() && (sidUid(sid) == uid() || ownsExam(sidCode(sid)));
+      // students: where('uid','==',me)      professors: where('examCode','==',code)
+      allow list: if isOwnSession() || professorOwns();
+
+      allow create: if emailVerified()
+        && sid == request.resource.data.examCode + '_' + uid()
+        && request.resource.data.uid == uid()
+        && request.resource.data.email == email()
+        && request.resource.data.status == 'in_progress'
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.heartbeatAt == request.time
+        && request.resource.data.violations == 0
+        && request.resource.data.answers is map
+        && request.resource.data.answers.size() == 0
+        && request.resource.data.keys().hasOnly(
+             ['examCode', 'examTitle', 'uid', 'email', 'displayName', 'studentId', 'section',
+              'status', 'startedAt', 'heartbeatAt', 'lastSavedAt', 'violations', 'answers',
+              'clientId', 'client', 'progress'])
+        && examIsOpen(exam(request.resource.data.examCode))
+        && studentAllowed(exam(request.resource.data.examCode));
+
+      allow update: if
+        // ---------------------------------------------------- student side
+        ( isOwnSession()
+          && resource.data.status == 'in_progress'
+          && withinDeadline(resource.data, exam(resource.data.examCode))
+          && changed().hasOnly(
+               ['answers', 'lastSavedAt', 'heartbeatAt', 'violations', 'status',
+                'submittedAt', 'lockedAt', 'clientId', 'progress'])
+          && request.resource.data.violations >= resource.data.violations
+          && request.resource.data.status in ['in_progress', 'submitted', 'locked']
+          && (request.resource.data.status != 'submitted'
+              || request.resource.data.submittedAt == request.time)
+          && (request.resource.data.status != 'locked'
+              || request.resource.data.lockedAt == request.time)
+        )
+        ||
+        // -------------------------------------------------- professor side
+        ( professorOwns()
+          && changed().hasOnly(
+               ['status', 'extraMinutes', 'note', 'flagged', 'submittedAt',
+                'lockedAt', 'unlockedAt', 'terminatedAt', 'reviewed', 'updatedAt'])
+          && request.resource.data.status in ['in_progress', 'submitted', 'locked', 'terminated']
+          && (!('extraMinutes' in request.resource.data)
+              || (request.resource.data.extraMinutes is int
+                  && request.resource.data.extraMinutes >= 0
+                  && request.resource.data.extraMinutes <= 600))
+        );
+
+      // Deleting a session = "reset attempt" for that student.
+      allow delete: if professorOwns();
+
+      match /events/{eventId} {
+        allow get, list: if (signedIn() && sidUid(sid) == uid()) || ownsExam(sidCode(sid));
+        allow create: if signedIn() && sidUid(sid) == uid()
+          && request.resource.data.at == request.time
+          && request.resource.data.type is string
+          && request.resource.data.type.size() <= 40
+          && request.resource.data.keys().hasOnly(['type', 'detail', 'at', 'clientId', 'q']);
+        allow update: if false;
+        allow delete: if ownsExam(sidCode(sid));
+      }
+    }
+
+    // ==================================================================
+    //  grades/{code}_{uid}   written by the professor's browser
+    // ==================================================================
+    match /grades/{sid} {
+      allow get: if ownsExam(sidCode(sid))
+        || (signedIn() && sidUid(sid) == uid()
+            && exists(examPath(sidCode(sid)))
+            && exam(sidCode(sid)).scoresReleased == true);
+      // professors: where('examCode','==',code)   (doc-id wildcards are not
+      // usable in list rules, so the query must constrain examCode)
+      allow list: if ownsExam(resource.data.examCode);
+      allow create, update: if ownsExam(sidCode(sid))
+        && request.resource.data.examCode == sidCode(sid)
+        && request.resource.data.uid == sidUid(sid)
+        && request.resource.data.gradedBy == uid();
+      allow delete: if ownsExam(sidCode(sid));
+    }
+
+    // deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

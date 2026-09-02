@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - name: Unit tests (grading, shuffling, import)
+        run: npm test
+      - name: Firestore security-rules tests (emulator)
+        run: npm run test:rules
+      - name: Install Chromium for the browser test
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end browser test (emulator)
+        run: npm run test:e2e
