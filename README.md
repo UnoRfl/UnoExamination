@@ -91,10 +91,13 @@ Use **Access** to promote other professors after they have signed in once.
 ## Running an exam
 
 1. **New exam** → fill details, timing and anti-cheat settings → add questions
-   or **Import** (`examples/info-assurance-prelim.json` is the original
-   Information Assurance prelim, converted; `examples/sample-mixed-types.json`
-   shows every question type; you can also paste the old `baseQuizData = [...]`
-   array directly).
+   or **Import** (`examples/sample-mixed-types.json` shows every question type;
+   to bring in an existing quiz, paste its old `baseQuizData = [...]` array
+   straight into the Import box — it is converted for you).
+
+   > **Keep real answer keys out of git.** Import them through the dashboard so
+   > the key is stored in Firestore where only you can read it. A key committed
+   > to a public repository is readable by anyone who finds the repo.
 2. **Publish** → you get a code like `K7M2XQ`. Students go to the site, sign
    in, type the code (or use *Copy student link*).
 3. Keep **Live monitor** open during the exam. Submissions are auto-graded as

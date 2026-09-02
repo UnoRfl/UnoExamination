@@ -6,3 +6,8 @@ firestore-debug.log
 ui-debug.log
 *.log
 .DS_Store
+
+# Never commit real exam content or answer keys - import them through the
+# dashboard instead, where the key lives in Firestore readable only by you.
+examples/*-answers.json
+examples/real-*.json
