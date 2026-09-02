@@ -23,10 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure Pages (enables it on first run)
+      # Pages must be switched on once by the repo owner:
+      # Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
+      # (The Actions token is not allowed to create the Pages site itself.)
+      - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       # Publish only what the browser needs. Tests, docs, rules and the
       # example question files are deliberately left out of the live site.
