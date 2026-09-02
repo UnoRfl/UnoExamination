@@ -17,8 +17,42 @@ if (!isConfigured()) {
   });
 }
 
+/**
+ * supabase-js serialises auth calls with the Web Locks API. If a lock is held
+ * by another tab that never released it, `getSession()` waits forever and the
+ * page sits on "Loading…" with no error. An exam must never hang like that, so
+ * this lock gives up after a few seconds and runs the work anyway. The only
+ * cost of losing the lock is that two tabs might refresh the same token
+ * concurrently, which is harmless.
+ */
+async function forgivingLock(name, acquireTimeout, fn) {
+  const locks = globalThis.navigator?.locks;
+  if (!locks?.request) return fn();               // no Web Locks: just run it
+  const timeout = acquireTimeout > 0 ? acquireTimeout : 5000;
+  let ranInsideLock = false;
+  try {
+    return await Promise.race([
+      locks.request(name, { mode: "exclusive" }, async () => {
+        ranInsideLock = true;
+        return fn();
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("auth lock timeout")), timeout)),
+    ]);
+  } catch (e) {
+    if (ranInsideLock) throw e;                   // the work itself failed
+    console.warn("auth lock unavailable, continuing without it:", e.message);
+    return fn();                                  // never leave the caller hanging
+  }
+}
+
 export const sb = createClient(supabaseConfig.url, supabaseConfig.publishableKey, {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+    lock: forgivingLock,
+  },
 });
 
 /** Unwrap a PostgREST response, turning an error into a throw. */

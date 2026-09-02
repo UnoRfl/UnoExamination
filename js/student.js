@@ -44,6 +44,7 @@ if (!CODE) {
 }
 
 function fatal(e) {
+  window.__unoRendered = true;
   console.error(e);
   app.innerHTML = `<div class="container narrow"><div class="card"><h2>Cannot load exam</h2>
     <div class="form-error">${esc(e.friendly || e.message)}</div>
@@ -51,6 +52,7 @@ function fatal(e) {
 }
 
 function renderSignIn() {
+  window.__unoRendered = true;
   clear(app);
   const host = h("div");
   app.append(h("div.container.narrow", h("div.card",
@@ -81,6 +83,7 @@ async function load() {
 
 // ---------------------------------------------------------------------- gate
 function renderGate(mode) {
+  window.__unoRendered = true;
   clear(app);
   const ex = S.exam, u = S.user;
 
@@ -244,6 +247,7 @@ function computeDeadline() {
 }
 
 function renderExam() {
+  window.__unoRendered = true;
   clear(app);
   const ex = S.exam, total = S.paper.length;
   const head = h("div.exam-head",
@@ -542,6 +546,7 @@ function handleDeadlinePassed() {
 }
 
 function renderDone(reason) {
+  window.__unoRendered = true;
   clear(app);
   app.append(h("div.container.narrow", h("div.card.center",
     h("h1", { style: { color: "var(--success)" } }, "Examination submitted"),
@@ -558,6 +563,7 @@ function renderDone(reason) {
 }
 
 function renderLocked() {
+  window.__unoRendered = true;
   clear(app);
   app.append(h("div.locked-screen", h("div",
     h("h1", "EXAMINATION LOCKED"),
@@ -575,6 +581,7 @@ function renderLocked() {
 }
 
 function renderTerminated() {
+  window.__unoRendered = true;
   clear(app);
   app.append(h("div.locked-screen", h("div",
     h("h1", "EXAMINATION TERMINATED"),
@@ -583,6 +590,7 @@ function renderTerminated() {
 }
 
 function renderMessage(title, body, reloadable) {
+  window.__unoRendered = true;
   clear(app);
   app.append(h("div.container.narrow", h("div.card.center",
     h("h1", title), h("p", body),
@@ -592,6 +600,7 @@ function renderMessage(title, body, reloadable) {
 
 // ------------------------------------------------------------------ review
 async function renderReview() {
+  window.__unoRendered = true;
   clear(app);
   let grade = null;
   try { grade = await myGrade(S.session.id); } catch {}

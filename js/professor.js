@@ -29,6 +29,7 @@ const P = { user: null, profile: null, unsubs: [] };
 
 // ---------------------------------------------------------------- auth
 watchAuth(async (user) => {
+  window.__unoRendered = true;
   clear($("#topRight"));
   if (!user) {
     clear(app);

@@ -32,6 +32,7 @@ const bad = (t, d, fix) => { failed++; return row(FAIL, t, d, fix, true); };
 const warn = (t, d, fix) => { warned++; return row(WARN, t, d, fix); };
 
 async function run() {
+  window.__unoRendered = true;
   clear(host); clear(actions); summary.hidden = true;
   failed = 0; warned = 0; pending = false;
 

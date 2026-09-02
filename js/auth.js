@@ -3,10 +3,43 @@ import { siteConfig } from "./config.js";
 import { myProfile } from "./db.js";
 import { $, h, toast } from "./ui.js";
 
-/** Fires immediately with the current session, then on every change. */
+/**
+ * Fires immediately with the current session, then on every change.
+ *
+ * Deliberately paranoid: whichever of getSession() or the INITIAL_SESSION event
+ * arrives first wins, and if neither has arrived in 6 seconds we assume signed
+ * out and render the sign-in form. A page that renders nothing is worse than a
+ * page that shows a sign-in box you can retry from.
+ */
 export function watchAuth(cb) {
-  sb.auth.getSession().then(({ data }) => cb(data.session?.user ?? null));
-  const { data: sub } = sb.auth.onAuthStateChange((_e, session) => cb(session?.user ?? null));
+  let delivered = false;
+  const deliver = (user) => {
+    delivered = true;
+    try { cb(user); } catch (e) { console.error("auth handler failed", e); }
+  };
+
+  const { data: sub } = sb.auth.onAuthStateChange((event, session) => {
+    if (event === "INITIAL_SESSION" && delivered) return;   // already handled
+    deliver(session?.user ?? null);
+  });
+
+  sb.auth.getSession()
+    .then(({ data, error }) => {
+      if (error) console.warn("getSession:", error.message);
+      if (!delivered) deliver(data?.session?.user ?? null);
+    })
+    .catch((e) => {
+      console.warn("getSession failed:", e?.message || e);
+      if (!delivered) deliver(null);
+    });
+
+  setTimeout(() => {
+    if (!delivered) {
+      console.warn("auth did not initialise in time; showing the sign-in form");
+      deliver(null);
+    }
+  }, 6000);
+
   return () => sub.subscription.unsubscribe();
 }
 

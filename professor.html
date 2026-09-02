@@ -7,28 +7,51 @@
 <link rel="stylesheet" href="css/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%237a0d1f'/><text x='50' y='68' font-size='56' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'>U</text></svg>">
   <script>
-    // If the page's module graph fails to load (offline, blocked script, bad
-    // deploy), the static markup below would sit there forever saying
-    // "Loading…". This says what actually happened instead.
+    // A page that renders nothing is the worst failure mode: the static markup
+    // below just says "Loading…" forever. This watches for the app actually
+    // PAINTING something (not merely for its scripts to load, which can succeed
+    // while a later promise hangs) and explains itself if it never does.
+    window.__unoRendered = false;
     window.__unoBooted = false;
+    window.__unoErrors = [];
     window.addEventListener("error", function (e) {
-      if (e && e.target && e.target.tagName === "SCRIPT") showBootError("A script failed to load: " + (e.target.src || "inline"));
+      if (e && e.target && e.target.tagName === "SCRIPT") {
+        showBootError("A script failed to load: " + (e.target.src || "inline"));
+      } else if (e && e.message) {
+        window.__unoErrors.push(e.message);
+      }
     }, true);
+    window.addEventListener("unhandledrejection", function (e) {
+      window.__unoErrors.push("Unhandled: " + ((e.reason && e.reason.message) || e.reason));
+    });
     setTimeout(function () {
-      if (!window.__unoBooted) showBootError("The page scripts did not finish loading.");
-    }, 8000);
+      if (window.__unoRendered) return;
+      var why = !window.__unoBooted
+        ? "The page scripts did not load."
+        : "The page loaded but could not reach the server.";
+      showBootError(why);
+    }, 10000);
     function showBootError(detail) {
-      if (document.getElementById("bootError")) return;
+      if (window.__unoRendered || document.getElementById("bootError")) return;
       var host = document.getElementById("app") || document.body;
+      var errs = (window.__unoErrors || []).slice(0, 3).join(" | ");
       var d = document.createElement("div");
       d.id = "bootError";
       d.style.cssText = "max-width:680px;margin:2rem auto;padding:1.2rem;border-radius:12px;background:#fdecec;color:#8a1f1f;font:14px/1.5 system-ui,sans-serif";
-      d.innerHTML = "<strong>This page could not start.</strong><p style='margin:.6rem 0'>" + detail +
-        "</p><p style='margin:.6rem 0'>Reload the page. If it keeps happening, your network may be blocking " +
-        "part of the site &mdash; try another connection, or tell your professor.</p>" +
-        "<button style='padding:.5rem 1rem;border-radius:8px;border:1px solid #8a1f1f;background:#fff;color:#8a1f1f;cursor:pointer' onclick='location.reload()'>Reload</button>";
+      d.innerHTML = "<strong>This page could not start.</strong>" +
+        "<p style='margin:.6rem 0'>" + detail + "</p>" +
+        (errs ? "<p style='margin:.6rem 0;font-family:monospace;font-size:12px;word-break:break-all'>" + errs + "</p>" : "") +
+        "<p style='margin:.6rem 0'>Try a reload. If it keeps happening, sign-in data in this browser may be stuck &mdash; " +
+        "use the reset button below, then reload.</p>" +
+        "<button id='bootReload' style='padding:.5rem 1rem;margin-right:.5rem;border-radius:8px;border:1px solid #8a1f1f;background:#fff;color:#8a1f1f;cursor:pointer'>Reload</button>" +
+        "<button id='bootReset' style='padding:.5rem 1rem;border-radius:8px;border:1px solid #8a1f1f;background:#8a1f1f;color:#fff;cursor:pointer'>Reset sign-in data</button>";
       host.innerHTML = "";
       host.appendChild(d);
+      document.getElementById("bootReload").onclick = function () { location.reload(); };
+      document.getElementById("bootReset").onclick = function () {
+        try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}
+        location.reload();
+      };
     }
   </script>
 </head>

@@ -31,6 +31,7 @@ watchAuth(async (user) => {
 });
 
 function renderSignedOut() {
+  window.__unoRendered = true;
   clear(app);
   app.append(
     h("div.card",
@@ -48,6 +49,7 @@ function renderSignedOut() {
 }
 
 function renderHome(user) {
+  window.__unoRendered = true;
   clear(app);
   const codeInput = h("input.input.mono", {
     placeholder: "e.g. K7M2XQ", maxlength: 12, autocomplete: "off",
