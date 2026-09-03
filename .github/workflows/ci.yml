@@ -16,8 +16,16 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Unit tests (risk model, importer, validation)
+      - name: Unit tests (risk model, importer, exam bundles, Excel)
         run: npm test
+
+      # Our .xlsx writer has no library behind it, so a round trip through our
+      # own reader proves only that the two halves agree. openpyxl is a real
+      # Excel parser and is the actual check that the bytes are a workbook.
+      - name: Validate the workbooks with a real Excel parser
+        run: |
+          python3 -m pip install --quiet openpyxl
+          python3 tests/xlsx-validate.py
 
       # The bug that shipped three times in a row was a page that loaded no
       # JavaScript, or hung, and said nothing. A real browser catches that; a

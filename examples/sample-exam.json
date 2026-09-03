@@ -1,0 +1,67 @@
+{
+  "format": "unoexamination.exam",
+  "version": 1,
+  "exam": {
+    "title": "Sample exam – every question type",
+    "course": "Demo",
+    "duration_minutes": 20,
+    "questions_per_student": 0
+  },
+  "questions": [
+    {
+      "id": "q001",
+      "type": "mc",
+      "prompt": "Which principle of the CIA triad is violated when data is altered without authorisation?",
+      "points": 1,
+      "options": [
+        "Confidentiality",
+        "Integrity",
+        "Availability",
+        "Non-repudiation"
+      ],
+      "correct": 1
+    },
+    {
+      "id": "q002",
+      "type": "multi",
+      "prompt": "Select every item that is a form of multi-factor authentication evidence.",
+      "points": 2,
+      "options": [
+        "Something you know",
+        "Something you have",
+        "Something you are",
+        "Something you like"
+      ],
+      "correct": [
+        0,
+        1,
+        2
+      ],
+      "partialCredit": true
+    },
+    {
+      "id": "q003",
+      "type": "tf",
+      "prompt": "Due diligence is the planning phase where policies are written.",
+      "points": 1,
+      "correct": false
+    },
+    {
+      "id": "q004",
+      "type": "text",
+      "prompt": "_____ represents legal responsibility, including the obligation to make restitution.",
+      "points": 1,
+      "accepted": [
+        "liability",
+        "legal liability"
+      ],
+      "caseSensitive": false
+    },
+    {
+      "id": "q005",
+      "type": "essay",
+      "prompt": "In 3–5 sentences, explain the difference between due care and due diligence with one example each.",
+      "points": 5
+    }
+  ]
+}

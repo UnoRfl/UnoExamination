@@ -51,24 +51,37 @@ export function toast(msg, kind = "info", ms = 3500) {
 }
 
 /** Promise-based modal. buttons: [{label, value, kind}] */
-export function dialog({ title, body, buttons = [{ label: "OK", value: true, kind: "primary" }], dismissible = true }) {
+export function dialog({ title, body, buttons = [{ label: "OK", value: true, kind: "primary" }], dismissible = true, wide = false }) {
   return new Promise((resolve) => {
     const overlay = h("div.modal-overlay");
-    const card = h("div.modal-card");
+    const card = h("div.modal-card" + (wide ? ".wide" : ""));
+    const restore = document.activeElement;
+
+    // Every exit runs through here, so the key listener can never outlive the
+    // dialog and swallow the next Escape the page sees.
+    const finish = (value) => {
+      document.removeEventListener("keydown", onKey, true);
+      overlay.remove();
+      if (restore?.focus) try { restore.focus(); } catch {}
+      resolve(value);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape" && dismissible) { e.stopPropagation(); finish(null); }
+    };
+
     if (title) card.append(h("h3.modal-title", title));
     card.append(typeof body === "string" ? h("div.modal-body", { html: body }) : h("div.modal-body", body));
     const actions = h("div.modal-actions");
     for (const b of buttons) {
-      actions.append(h(`button.btn.btn-${b.kind || "secondary"}`, {
-        onclick: () => { overlay.remove(); resolve(b.value); },
-      }, b.label));
+      actions.append(h(`button.btn.btn-${b.kind || "secondary"}`, { onclick: () => finish(b.value) }, b.label));
     }
     card.append(actions);
     overlay.append(card);
-    if (dismissible) overlay.addEventListener("click", (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } });
+    if (dismissible) overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(null); });
+    document.addEventListener("keydown", onKey, true);
     document.body.append(overlay);
-    const first = actions.querySelector("button");
-    first && first.focus();
+    // The primary action, not the Cancel that usually comes first.
+    (actions.querySelector(".btn-primary, .btn-danger, .btn-success") || actions.querySelector("button"))?.focus();
   });
 }
 
@@ -124,10 +137,6 @@ export function downloadText(filename, text, mime = "text/plain") {
   a.href = URL.createObjectURL(new Blob([text], { type: mime }));
   a.download = filename; document.body.append(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-}
-export function csvEscape(v) {
-  const s = String(v ?? "");
-  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 export const qs = (k) => new URLSearchParams(location.search).get(k);
 export const randomId = (n = 12) => {

@@ -8,7 +8,8 @@ ui-debug.log
 .DS_Store
 
 # Never commit real exam content or answer keys - import them through the
-# dashboard instead, where the key lives in Firestore readable only by you.
+# dashboard instead, where the key lives in Postgres readable only by you.
 examples/*-answers.json
 examples/real-*.json
 tests/smoke/out/
+tests/out/

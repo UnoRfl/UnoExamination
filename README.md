@@ -9,10 +9,10 @@ plan, nothing to maintain.
 
 |                     | Professors                                                        | Students                                                   |
 |---------------------|-------------------------------------------------------------------|------------------------------------------------------------|
-| Build exams         | multiple choice, multi-select, true/false, short answer, essay; import the old single-file quiz format or JSON | sign in with Google or e-mail, enter a 6-character code |
+| Build exams         | multiple choice, multi-select, true/false, short answer, essay; import a whole paper from one Excel, CSV or JSON file | sign in with Google or e-mail, enter a 6-character code |
 | Anti-cheat          | fullscreen, tab/window/blur, copy-paste, devtools, reload, second-tab, offline detection; configurable strike limit → warn / lock / auto-submit | clear rules page, live strike counter, autosave, resume after crash |
 | Live monitor        | who is online, progress, time left, violations, risk score; unlock, add time, force-submit, terminate, reset | server-side timer — closing the page does not pause it |
-| Grading             | auto-graded **inside the database**, so the answer key never reaches any browser; manual points for essays; release scores; CSV export | see score & feedback once released |
+| Grading             | auto-graded **inside the database**, so the answer key never reaches any browser; manual points for essays; release scores; Excel export | see score & feedback once released |
 
 Read [`docs/SECURITY.md`](docs/SECURITY.md) for what is enforced by the
 server versus what is only evidence, and [`docs/PRIOR-ART.md`](docs/PRIOR-ART.md)
@@ -59,10 +59,10 @@ The live deployment is already configured. To stand up your own copy:
 
 ## Running an exam
 
-1. **New exam** → fill details, timing and anti-cheat settings → add questions
-   or **Import** (`examples/sample-mixed-types.json` shows every question type;
-   to bring in an existing quiz, paste its old `baseQuizData = [...]` array
-   straight into the Import box — it is converted for you).
+1. **New exam** → pick a preset (Practice / Standard quiz / Strict proctored),
+   adjust anything you want, then add questions — or skip all of it and use
+   **Import an exam** on the *My exams* page to turn one file into a complete
+   draft. See [Importing a whole exam](#importing-a-whole-exam).
 
    > **Keep real answer keys out of git.** Import them through the dashboard so
    > the key is stored in the database where only you can read it. A key committed
@@ -72,7 +72,9 @@ The live deployment is already configured. To stand up your own copy:
 3. Keep **Live monitor** open during the exam. Submissions are auto-graded as
    they arrive. Click a student to see answers, the full event timeline and
    risk reasons; unlock / add time / force-submit / terminate / reset as needed.
-4. **Grades** → grade essays, **Release scores**, **Export CSV**.
+4. **Grades** → grade essays, **Release scores**, **Export to Excel** (a
+   workbook with a summary sheet, one row per student, and an item analysis
+   showing which questions the class found hard).
 
 ### Exam settings explained
 
@@ -124,30 +126,97 @@ confirm and delete throwaway accounts:
 SUPABASE_SERVICE_KEY=... npm run test:e2e
 ```
 
-The site is plain ES modules; the Supabase SDK loads from a CDN. There is no build step.
+The site is plain ES modules. The Supabase SDK is vendored into
+`js/vendor/supabase-js.js` (`npm run vendor` to rebuild), so the page makes no
+request to any CDN. Excel files are written and read by `js/xlsx.js`, which
+builds the ZIP and SheetML by hand — again, no dependency to load.
 
-## Import format
+## Importing a whole exam
+
+Three ways in, all from the same button. **My exams → Import an exam** turns a
+file into a complete draft; **Import a file** inside an editor adds to or
+replaces the paper you are working on.
+
+### 1. An Excel or CSV question sheet (easiest)
+
+Download the template from either import dialog — it ships with one worked
+example of every question type and a sheet explaining each column. One row per
+question:
+
+| Type | Points | Question | Option A | Option B | Option C | Correct | Case sensitive | Partial credit |
+|---|---|---|---|---|---|---|---|---|
+| mc | 1 | Which control limits the damage of a stolen password? | Rotation | MFA | Longer passwords | `B` | | |
+| multi | 2 | Which are administrative controls? | Policy | Firewall rule | Training | `A, C` | | `TRUE` |
+| tf | 1 | Encryption at rest protects a stolen disk. | | | | `TRUE` | | |
+| text | 1 | Giving a user only the access they need is called…? | | | | `least privilege \| POLP` | `FALSE` | |
+| essay | 10 | Explain defence in depth. | | | | | | |
+
+- **Correct** is a letter (`B`) or a number (`2`) for `mc`; several letters for
+  `multi`; `TRUE`/`FALSE` for `tf`; every accepted answer separated by `|` for
+  `text`; blank for `essay`.
+- Column order does not matter and extra columns are ignored, so your existing
+  question bank probably imports as-is.
+- Leave **Type** blank and it is inferred from the shape of the row.
+- Add as many `Option …` columns as you need.
+- An optional second sheet named **Settings** carries duration, violation limit
+  and the rest; anything you leave blank keeps the exam's current value.
+
+Anything the importer could not read with confidence is reported *before* you
+commit — it never guesses silently.
+
+**Export → Excel** writes this exact format back out, so you can edit a live
+exam in Excel and import it again.
+
+### 2. A JSON bundle (exact round-trip)
+
+**Export → JSON** produces this, and it is the format to hand-write if you
+prefer. The answer key sits on the question:
 
 ```json
 {
+  "format": "unoexamination.exam",
+  "version": 1,
+  "exam": { "title": "Prelim", "duration_minutes": 60, "shuffle_questions": true },
   "questions": [
-    { "id": "q001", "type": "mc",    "prompt": "…", "options": ["a","b","c"], "points": 1 },
-    { "id": "q002", "type": "multi", "prompt": "…", "options": ["a","b","c"], "points": 2 },
-    { "id": "q003", "type": "tf",    "prompt": "…", "points": 1 },
-    { "id": "q004", "type": "text",  "prompt": "…", "points": 1 },
-    { "id": "q005", "type": "essay", "prompt": "…", "points": 5 }
-  ],
-  "answers": {
-    "q001": { "correct": 1 },
-    "q002": { "correct": [0, 2], "partialCredit": true },
-    "q003": { "correct": false },
-    "q004": { "accepted": ["liability", "legal liability"], "caseSensitive": false },
-    "q005": {}
-  }
+    { "type": "mc",    "prompt": "…", "options": ["a","b","c"], "points": 1, "correct": 1 },
+    { "type": "multi", "prompt": "…", "options": ["a","b","c"], "points": 2, "correct": [0,2], "partialCredit": true },
+    { "type": "tf",    "prompt": "…", "points": 1, "correct": false },
+    { "type": "text",  "prompt": "…", "points": 1, "accepted": ["liability","legal liability"], "caseSensitive": false },
+    { "type": "essay", "prompt": "…", "points": 5 }
+  ]
 }
 ```
 
-The legacy `[{ "type": "text", "q": "…", "a": ["…"] }]` array is accepted as-is.
+`exam` is optional, and only the settings listed in `js/bundle.js` are read —
+a file can never release scores, change ownership or publish an exam.
+
+Two ready-made samples live in [`examples/`](examples/):
+[`sample-exam.json`](examples/sample-exam.json) and
+[`sample-questions.csv`](examples/sample-questions.csv) — the same five-question
+paper in both formats. Both are checked by the test suite, so they always import.
+
+### 3. The older shapes
+
+The split `{questions, answers}` export from earlier versions and the legacy
+`baseQuizData = [{ "type": "text", "q": "…", "a": ["…"] }]` array both still
+import unchanged.
+
+> **Keep real answer keys out of git.** Import them through the dashboard so the
+> key is stored in the database where only you can read it. A key committed to a
+> public repository is readable by anyone who finds the repo.
+
+## Exporting
+
+Everything leaves as a real `.xlsx` workbook — never CSV.
+
+| Where | Sheets |
+|---|---|
+| Live monitor / Grades → **Export to Excel** | *Summary* (exam, class average, counts), *Students* (one row each, with risk, score and note), *Item analysis* (correct/partial/wrong per question) |
+| Editor → **Excel** | *Questions*, *Settings*, *How to fill this in* — the importable format |
+| Student drawer → **Event log** | every recorded event with its timestamp, seconds into the exam and weight |
+
+Dates are real dates and scores are real numbers, so sorting and averaging work
+without cleaning the file first.
 
 ## Limitations (read before a high-stakes exam)
 

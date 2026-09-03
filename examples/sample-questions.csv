@@ -1,0 +1,6 @@
+Type,Points,Question,Option A,Option B,Option C,Option D,Correct,Case sensitive,Partial credit
+mc,1,Which principle of the CIA triad is violated when data is altered without authorisation?,Confidentiality,Integrity,Availability,Non-repudiation,B,,
+multi,2,Select every item that is a form of multi-factor authentication evidence.,Something you know,Something you have,Something you are,Something you like,"A, B, C",,TRUE
+tf,1,Due diligence is the planning phase where policies are written.,,,,,FALSE,,
+text,1,"_____ represents legal responsibility, including the obligation to make restitution.",,,,,liability | legal liability,FALSE,
+essay,5,"In 3–5 sentences, explain the difference between due care and due diligence with one example each.",,,,,,,

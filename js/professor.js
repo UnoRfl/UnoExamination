@@ -13,10 +13,15 @@ import {
   watchExamSessions, watchExamGrades,
 } from "./db.js";
 import { QUESTION_TYPES, validateQuestion, validateKey, paperMaxPoints } from "./paper.js";
-import { riskScore, importQuestions, EVENT_WEIGHTS } from "./grading.js";
+import { riskScore, EVENT_WEIGHTS } from "./grading.js";
+import { downloadXlsx, readTable, S as XS } from "./xlsx.js";
+import {
+  toBundle, toQuestionSheet, templateSheets, BUNDLE_SETTINGS,
+  questionsFromTable, fromBundleJson,
+} from "./bundle.js";
 import {
   $, $$, h, esc, toast, dialog, confirmDialog, promptDialog, fmtDate, fmtTime, ago, mmss,
-  toDate, toLocalInput, clear, downloadText, csvEscape, examCode, randomId,
+  toDate, toLocalInput, clear, downloadText, examCode, randomId,
 } from "./ui.js";
 
 // tells the boot watchdog in the HTML that the module graph loaded
@@ -29,9 +34,13 @@ const P = { user: null, profile: null, unsubs: [] };
 
 // ---------------------------------------------------------------- auth
 watchAuth(async (user) => {
-  window.__unoRendered = true;
+  // __unoRendered means "something is on the screen", so it is set by whichever
+  // branch actually paints — never here. Setting it up front would tell the boot
+  // watchdog all was well while an awaited call below hung on a blank page,
+  // which is the exact failure it exists to catch.
   clear($("#topRight"));
   if (!user) {
+    window.__unoRendered = true;
     clear(app);
     const host = h("div");
     app.append(h("div.container.narrow", h("div.card", h("h2", "Professor sign-in"), host)));
@@ -40,7 +49,11 @@ watchAuth(async (user) => {
   }
   P.user = user;
   try { P.profile = await myProfile(); }
-  catch (e) { app.innerHTML = `<div class="container"><div class="card"><div class="form-error">${esc(e.friendly || e.message)}</div></div></div>`; return; }
+  catch (e) {
+    window.__unoRendered = true;
+    app.innerHTML = `<div class="container"><div class="card"><div class="form-error">${esc(e.friendly || e.message)}</div></div></div>`;
+    return;
+  }
 
   $("#topRight").append(
     h("span.small.muted", user.email),
@@ -53,6 +66,7 @@ watchAuth(async (user) => {
 });
 
 function renderNotProfessor(user) {
+  window.__unoRendered = true;
   clear(app);
   const codeI = h("input.input", { placeholder: "XXXXX-XXXXX-XXXXX", autocomplete: "off",
     style: { textTransform: "uppercase", letterSpacing: ".08em" } });
@@ -97,6 +111,7 @@ function route() {
   );
   const main = h("main.main");
   app.append(h("div.dash", nav, main));
+  window.__unoRendered = true;
   if (view === "new") return viewEditor(main, null);
   if (view === "exam" && code) {
     if (sub === "monitor") return viewMonitor(main, code);
@@ -135,12 +150,22 @@ const effectiveStatus = (s, ex) => {
 
 // ------------------------------------------------------------- exams list
 async function viewExams(main) {
-  main.append(h("div.card-head", h("h1", "My exams"), h("a.btn.btn-primary", { href: "#new" }, "➕ New exam")));
+  main.append(h("div.card-head", h("h1", "My exams"),
+    h("div.row",
+      h("button.btn", { onclick: importWholeExam }, "⬆ Import an exam"),
+      h("a.btn.btn-primary", { href: "#new" }, "➕ New exam"))));
   const host = h("div.grid.grid-2"); main.append(host);
   try {
     const exams = await myExams();
     if (!exams.length) {
-      return host.append(h("div.empty", "No exams yet. Create one, or import your existing question list."));
+      return host.append(h("div.empty", { style: { gridColumn: "1 / -1" } },
+        h("div", { style: { fontSize: "2rem", marginBottom: ".4rem" } }, "📝"),
+        h("div", { style: { fontWeight: 600, color: "var(--text)" } }, "No exams yet"),
+        h("div.small", { style: { marginTop: ".3rem" } },
+          "Build one question at a time, or bring in a whole paper from Excel in one go."),
+        h("div.row", { style: { marginTop: "1rem", justifyContent: "center" } },
+          h("a.btn.btn-primary", { href: "#new" }, "➕ New exam"),
+          h("button.btn", { onclick: importWholeExam }, "⬆ Import an exam"))));
     }
     for (const ex of exams) {
       host.append(h("div.card.exam-tile", {
@@ -161,6 +186,100 @@ async function viewExams(main) {
       ));
     }
   } catch (e) { host.append(h("div.form-error", e.friendly || e.message)); }
+}
+
+/**
+ * Creates a complete exam from one dropped file. The editor's own importer
+ * fills an open form; this one goes from nothing to a saved draft, which is
+ * what a professor with a question bank actually wants.
+ */
+async function importWholeExam() {
+  const zone = h("div.dropzone", h("div.dz-icon", "📄"),
+    h("div.dz-main", "Drop your exam file here, or click to choose"),
+    h("div.dz-sub", "Excel (.xlsx), CSV, or a JSON exam bundle"));
+  const input = h("input", { type: "file", accept: ".xlsx,.xlsm,.csv,.tsv,.txt,.json,.js", hidden: true });
+  zone.append(input);
+  zone.onclick = () => input.click();
+  zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("over"); };
+  zone.ondragleave = () => zone.classList.remove("over");
+  zone.ondrop = (e) => {
+    e.preventDefault(); zone.classList.remove("over");
+    if (e.dataTransfer.files?.length) { input.files = e.dataTransfer.files; input.dispatchEvent(new Event("change")); }
+  };
+
+  const titleI = h("input.input", { placeholder: "e.g. Information Assurance – Prelim Examination" });
+  const status = h("div.import-status", { hidden: true });
+  let parsed = null;
+
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    zone.classList.add("filled");
+    zone.querySelector(".dz-main").textContent = file.name;
+    zone.querySelector(".dz-sub").textContent = `${(file.size / 1024).toFixed(0)} KB · click to change`;
+    status.hidden = false; clear(status); status.className = "import-status";
+    try {
+      const name = file.name.toLowerCase();
+      if (name.endsWith(".json") || name.endsWith(".js")) {
+        const b = fromBundleJson(await file.text());
+        parsed = { settings: b.exam, questions: b.questions, warnings: b.warnings };
+      } else {
+        const t = questionsFromTable(await readTable(file));
+        parsed = { settings: {}, questions: t.questions, warnings: t.warnings };
+      }
+      if (parsed.settings.title && !titleI.value) titleI.value = parsed.settings.title;
+      if (!titleI.value) titleI.value = file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
+      const pts = parsed.questions.reduce((n, q) => n + (Number(q.points) || 0), 0);
+      status.classList.add(parsed.warnings.length ? "warn" : "ok");
+      status.append(
+        h("div.is-head", parsed.warnings.length ? "⚠ Read with warnings" : "✓ Ready to import"),
+        h("div.small", `${parsed.questions.length} questions · ${pts} points`),
+        parsed.warnings.length ? h("ul.is-warns", parsed.warnings.slice(0, 6).map((w) => h("li", w))) : null,
+        parsed.warnings.length ? h("div.small.muted", "You can fix these in the editor afterwards.") : null,
+      );
+    } catch (e) {
+      parsed = null;
+      status.classList.add("bad");
+      status.append(h("div.is-head", "Could not read that"), h("div.small", e.message));
+    }
+  };
+
+  const ok = await dialog({
+    title: "Import an exam",
+    wide: true,
+    body: h("div.stack",
+      h("p.help", { style: { marginTop: 0 } },
+        "One file becomes a complete draft exam — questions, points and answer key. ",
+        h("a", { href: "#", onclick: (e) => { e.preventDefault(); downloadXlsx("uno-exam-template.xlsx", templateSheets()); } },
+          "Download the Excel template"), " if you have not made one before."),
+      zone, status,
+      h("label.field", h("span", "Exam title"), titleI),
+      h("p.help", "It is created as a draft with the standard settings, so nothing goes live until you publish it.")),
+    buttons: [{ label: "Cancel", value: false }, { label: "Create draft exam", value: true, kind: "primary" }],
+  });
+  if (!ok) return;
+  if (!parsed) return toast("Nothing was imported — choose a file first.", "error");
+  if (!titleI.value.trim()) return toast("Give the exam a title.", "error");
+
+  const code = examCode(6);
+  const questions = parsed.questions.map((q, i) => ({ ...q, id: `q${String(i + 1).padStart(3, "0")}` }));
+  const row = {
+    ...BUNDLE_SETTINGS, ...parsed.settings,
+    code, owner_id: P.user.id, owner_name: P.profile?.display_name || P.user.email,
+    title: titleI.value.trim(), status: "draft",
+    opens_at: new Date().toISOString(),
+    closes_at: new Date(Date.now() + 30 * 86400_000).toISOString(),
+    scores_released: false,
+    question_count: questions.length,
+    total_points: paperMaxPoints(questions),
+    updated_at: new Date().toISOString(),
+  };
+  try {
+    await saveExam(row);
+    await replaceQuestions(code, questions);
+    toast(`Created "${row.title}" with ${questions.length} questions.`, "success");
+    location.hash = `#exam/${code}/edit`;
+  } catch (e) { toast(e.friendly || e.message, "error", 7000); }
 }
 
 // ----------------------------------------------------------------- editor
@@ -305,6 +424,10 @@ async function viewEditor(main, code) {
 
   const TYPE_CHIP = { mc: "Choice", multi: "Multi", tf: "T / F", text: "Short", essay: "Essay" };
   const isIncomplete = (q, i) => validateQuestion(q, i).length > 0 || validateKey(q, q.key, i).length > 0;
+  // Search the options and accepted answers too — "which question was the one
+  // about least privilege?" is asked of the answer at least as often as the text.
+  const searchText = (q) => [q.prompt, ...(q.options || []), ...(q.key?.accepted || [])]
+    .join(" ").toLowerCase();
 
   function updateStats() {
     const bad = questions.filter(isIncomplete).length;
@@ -321,7 +444,7 @@ async function viewEditor(main, code) {
     const list = h("div.q-list");
     let shown = 0;
     questions.forEach((q, i) => {
-      if (term && !(q.prompt || "").toLowerCase().includes(term)) return;
+      if (term && !searchText(q).includes(term)) return;
       shown++;
       list.append(qRow(q, i));
       if (q.id === openQid) list.append(h("div.q-body", qEditor(q, i)));
@@ -538,42 +661,153 @@ async function viewEditor(main, code) {
     }
   }
 
+  // ---- one file in, a whole paper out
+  const dropZone = () => {
+    const zone = h("div.dropzone", h("div.dz-icon", "📄"),
+      h("div.dz-main", "Drop a file here, or click to choose"),
+      h("div.dz-sub", "Excel (.xlsx), CSV, or a JSON exam bundle"));
+    const input = h("input", { type: "file", accept: ".xlsx,.xlsm,.csv,.tsv,.txt,.json,.js", hidden: true });
+    zone.append(input);
+    zone.onclick = () => input.click();
+    zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("over"); };
+    zone.ondragleave = () => zone.classList.remove("over");
+    zone.ondrop = (e) => {
+      e.preventDefault(); zone.classList.remove("over");
+      const fl = e.dataTransfer.files?.[0];
+      if (fl) { input.files = e.dataTransfer.files; input.dispatchEvent(new Event("change")); }
+    };
+    return { zone, input };
+  };
+
+  /**
+   * Reads whichever of the three formats the professor dropped.
+   * @returns {{settings:object, questions:object[], warnings:string[], source:string}}
+   */
+  async function readExamFile(file, pastedText) {
+    if (!file && !String(pastedText || "").trim()) throw new Error("Choose a file, or paste your questions in the box.");
+    if (!file) {
+      const b = fromBundleJson(pastedText);
+      return { settings: b.exam, questions: b.questions, warnings: b.warnings, source: "pasted text" };
+    }
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".json") || name.endsWith(".js")) {
+      const b = fromBundleJson(await file.text());
+      return { settings: b.exam, questions: b.questions, warnings: b.warnings, source: file.name };
+    }
+    // A spreadsheet: the first sheet is the questions, a "Settings" sheet is
+    // optional. readTable only gives us sheet 1, so settings come from the
+    // bundle path or are simply left alone.
+    const rows = await readTable(file);
+    const t = questionsFromTable(rows);
+    return { settings: {}, questions: t.questions, warnings: t.warnings, source: file.name };
+  }
+
   async function importDialog() {
-    const ta = h("textarea", { rows: 12, style: { fontFamily: "var(--mono)", fontSize: ".8rem" },
-      placeholder: 'Paste JSON exported from this app, or the legacy JS array:\n[ { type: "text", q: "Question…", a: ["answer 1", "answer 2"] }, … ]' });
-    const file = h("input", { type: "file", accept: ".json,.js,.txt",
-      onchange: async (e) => { const fl = e.target.files[0]; if (fl) ta.value = await fl.text(); } });
-    const mode = h("select", h("option", { value: "append" }, "Append to existing questions"),
-      h("option", { value: "replace" }, "Replace all questions"));
+    const { zone, input } = dropZone();
+    const ta = h("textarea", { rows: 6, style: { fontFamily: "var(--mono)", fontSize: ".78rem" },
+      placeholder: '{ "exam": { "title": "Prelim" }, "questions": [ { "type": "mc", "prompt": "…", "options": ["a","b"], "correct": 1 } ] }' });
+    const status = h("div.import-status", { hidden: true });
+    const mode = h("select",
+      h("option", { value: "append" }, "Add to the questions already here"),
+      h("option", { value: "replace" }, "Replace every question"));
+    let picked = null, parsed = null;
+
+    const preview = async () => {
+      status.hidden = false; clear(status); status.className = "import-status";
+      try {
+        parsed = await readExamFile(picked, ta.value);
+        const byType = {};
+        for (const q of parsed.questions) byType[q.type] = (byType[q.type] || 0) + 1;
+        const pts = parsed.questions.reduce((n, q) => n + (Number(q.points) || 0), 0);
+        status.classList.add(parsed.warnings.length ? "warn" : "ok");
+        status.append(
+          h("div.is-head", parsed.warnings.length ? "⚠ Read with warnings" : "✓ Ready to import"),
+          h("div.small", `${parsed.questions.length} questions · ${pts} points · from ${parsed.source}`),
+          h("div.small.muted", Object.entries(byType)
+            .map(([t, n]) => `${n} × ${(QUESTION_TYPES[t] || t).split(" (")[0]}`).join(" · ")),
+          parsed.warnings.length
+            ? h("ul.is-warns", parsed.warnings.slice(0, 8).map((w) => h("li", w)))
+            : null,
+          parsed.warnings.length > 8 ? h("div.small.muted", `…and ${parsed.warnings.length - 8} more.`) : null,
+        );
+      } catch (e) {
+        parsed = null;
+        status.classList.add("bad");
+        status.append(h("div.is-head", "Could not read that"), h("div.small", e.message));
+      }
+    };
+    input.onchange = () => {
+      picked = input.files?.[0] || null;
+      if (picked) {
+        zone.classList.add("filled");
+        zone.querySelector(".dz-main").textContent = picked.name;
+        zone.querySelector(".dz-sub").textContent = `${(picked.size / 1024).toFixed(0)} KB · click to change`;
+        preview();
+      }
+    };
+    ta.oninput = () => { if (!picked && ta.value.trim()) preview(); };
+
     const ok = await dialog({
       title: "Import questions",
+      wide: true,
       body: h("div.stack",
-        h("p.help", "Accepted: our JSON export ({questions, answers}), a plain array of " +
-          "{type,q|prompt,a|accepted|correct,options}, or the exact baseQuizData array from the old single-file quiz."),
-        file, ta, h("label.field", h("span", "Mode"), mode)),
+        h("p.help", { style: { marginTop: 0 } },
+          "Bring in a whole paper at once. Never made one before? ",
+          h("a", { href: "#", onclick: (e) => { e.preventDefault(); downloadTemplate(); } },
+            "Download the Excel template"), " — it has one worked example of every question type."),
+        zone,
+        h("details.group", h("summary", "…or paste JSON / the old quiz array"), h("div.group-body", ta)),
+        status,
+        h("label.field", h("span", "Where do they go?"), mode)),
       buttons: [{ label: "Cancel", value: false }, { label: "Import", value: true, kind: "primary" }],
     });
     if (!ok) return;
     try {
-      const { questions: qs, answers } = importQuestions(ta.value);
-      const incoming = qs.map((q) => ({
-        id: newQid(), type: q.type, prompt: q.prompt,
-        options: q.options || [], points: Number(q.points) || 1,
-        key: answers[q.id] || {},
-      }));
+      if (!parsed) await preview();
+      if (!parsed) return toast("Nothing was imported — the file could not be read.", "error", 6000);
+      const incoming = parsed.questions.map((q) => ({ ...q, id: newQid() }));
       if (mode.value === "replace") questions = incoming; else questions.push(...incoming);
+
+      // A JSON bundle can also carry the settings; fill in anything the
+      // professor has not typed yet rather than overwriting their work.
+      let applied = 0;
+      for (const [k, v] of Object.entries(parsed.settings || {})) {
+        if (!(k in f)) continue;
+        if (f[k].input) { f[k].input.checked = !!v; applied++; continue; }
+        const blank = !String(f[k].value ?? "").trim() || f[k].value === "0";
+        const val = Array.isArray(v) ? v.join("\n") : String(v);
+        if (blank || k === "duration_minutes" || k === "max_violations") { f[k].value = val; applied++; }
+      }
+      openQid = null;
       render();
-      toast(`Imported ${incoming.length} questions.`, "success");
+      toast(`Imported ${incoming.length} questions${applied ? " and the exam settings" : ""}.`, "success");
+      if (parsed.warnings.length) {
+        toast(`${parsed.warnings.length} question(s) need a look — they are marked in the list.`, "warn", 7000);
+      }
     } catch (e) { toast("Import failed: " + e.message, "error", 6000); }
   }
 
-  const exportJson = () => downloadText(
-    `${(f.title.value || "exam").replace(/[^a-z0-9]+/gi, "-")}.json`,
-    JSON.stringify({
-      title: f.title.value,
-      questions: questions.map((q, i) => ({ id: `q${i + 1}`, type: q.type, prompt: q.prompt, options: q.options, points: q.points })),
-      answers: Object.fromEntries(questions.map((q, i) => [`q${i + 1}`, q.key || {}])),
-    }, null, 2), "application/json");
+  const slug = () => (f.title.value || ex.code || "exam").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  const examRowNow = () => {
+    const row = { title: f.title.value, course: f.course.value, instructions: f.instructions.value,
+      duration_minutes: Number(f.duration_minutes.value), max_violations: Number(f.max_violations.value),
+      violation_action: f.violation_action.value, questions_per_student: Number(f.questions_per_student.value),
+      allowed_domain: f.allowed_domain.value.trim(),
+      roster: f.roster.value.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean) };
+    for (const k of ["require_fullscreen", "block_clipboard", "shuffle_questions", "shuffle_options",
+      "one_at_a_time", "require_student_id", "show_correct_answers"]) row[k] = f[k].input.checked;
+    return row;
+  };
+  const exportExcel = () => {
+    downloadXlsx(`${slug()}-questions.xlsx`, toQuestionSheet(examRowNow(), questions));
+    toast("Workbook downloaded. Edit it in Excel and import it back any time.", "success");
+  };
+  const exportJson = () => downloadText(`${slug()}.json`,
+    JSON.stringify(toBundle(examRowNow(), questions), null, 2), "application/json");
+  const downloadTemplate = () => {
+    downloadXlsx("uno-exam-template.xlsx", templateSheets());
+    toast("Template downloaded — fill in the Questions sheet and import it.", "success");
+  };
 
   main.append(...[
     h("div.card-head", h("h1", ex.code ? "Edit exam" : "New exam"),
@@ -643,10 +877,14 @@ async function viewEditor(main, code) {
     ),
     h("div.card",
       h("div.card-head", h("div", h("h3", "Questions"), stats),
-        h("div.row", h("button.btn.btn-sm", { onclick: importDialog }, "⬆ Import"),
-          h("button.btn.btn-sm", { onclick: exportJson }, "⬇ Export JSON"))),
+        h("div.row",
+          h("button.btn.btn-sm.btn-primary", { onclick: importDialog }, "⬆ Import a file"),
+          h("button.btn.btn-sm", { title: "Edit this paper in Excel, then import it back",
+            onclick: exportExcel }, "⬇ Excel"),
+          h("button.btn.btn-sm", { title: "The whole exam as a JSON bundle — settings included",
+            onclick: exportJson }, "⬇ JSON"))),
       h("div.q-toolbar", qFilter,
-        h("span.small.muted", "Click a row to edit it."),
+        h("span.small.muted", "Click a row to edit it. Search covers options and answers too."),
         h("div.spacer"),
         h("button.btn.btn-sm", { type: "button", title: "Collapse the open question",
           onclick: () => { openQid = null; render(); } }, "Collapse all")),
@@ -716,7 +954,7 @@ async function viewMonitor(main, code) {
         h("div.row", search, h("label.check.small", onlyFlag, h("span", "Only flagged / at-risk"))),
         h("div.row",
           h("button.btn.btn-sm", { onclick: analyseAll }, "🔍 Analyse risk (loads event logs)"),
-          h("button.btn.btn-sm", { onclick: () => exportCsv(ex, sessions, grades, risks) }, "⬇ CSV"))),
+          h("button.btn.btn-sm", { onclick: () => exportWorkbook(ex, sessions, grades, risks) }, "⬇ Excel"))),
       h("div.table-wrap", h("table.table",
         h("thead", h("tr", h("th", "Student"), h("th", "Status"), h("th", "Progress"), h("th", "Time left"),
           h("th", "Violations"), h("th", "Risk"), h("th", "Score"), h("th", "Actions"))),
@@ -962,10 +1200,20 @@ async function openDrawer(ex, s, grade, risks, onSaved) {
           catch (e) { toast(e.friendly || e.message, "error"); }
         } }, s.flagged ? "🏳 Unflag" : "🚩 Flag for review"),
         h("div.spacer"),
-        h("a.small", { href: "#", onclick: (e) => {
-          e.preventDefault();
-          downloadText(`${s.id}-events.json`, JSON.stringify(events, null, 2), "application/json");
-        } }, "download event log"),
+        h("button.btn.btn-sm", { title: "One row per recorded event, with the raw detail",
+          onclick: () => {
+            const rows = [["When", "Seconds in", "Event", "Weight", "Question", "Detail"]];
+            const t0 = s.started_at ? new Date(s.started_at).getTime() : null;
+            for (const e of events) {
+              const at = new Date(e.at);
+              rows.push([at, t0 ? Math.round((at.getTime() - t0) / 1000) : "",
+                e.type, EVENT_WEIGHTS[e.type] ?? 0, e.question || "",
+                { v: e.detail && Object.keys(e.detail).length ? JSON.stringify(e.detail) : "", s: XS.MUTED }]);
+            }
+            downloadXlsx(`${(s.display_name || s.email || "student").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-event-log.xlsx`, [
+              { name: "Event log", rows, filter: true, cols: [19, 11, 24, 9, 12, 60] },
+            ]);
+          } }, "⬇ Event log (Excel)"),
       )),
   );
   document.body.append(drawer);
@@ -1068,7 +1316,7 @@ async function viewGrades(main, code) {
         } }, "♻ Regrade all"),
       releaseBtn,
       h("div.spacer"),
-      h("button.btn", { onclick: () => exportCsv(ex, sessions, grades, risks) }, "⬇ Export CSV"),
+      h("button.btn", { onclick: () => exportWorkbook(ex, sessions, grades, risks) }, "⬇ Export to Excel"),
     ), h("p.help", { style: { marginTop: ".6rem" } },
       "Grading runs inside the database, so the answer key is never sent to this browser. " +
       "Attempts whose time has expired are graded from their last saved answers. " +
@@ -1081,18 +1329,100 @@ async function viewGrades(main, code) {
   fill();
 }
 
-function exportCsv(ex, sessions, grades, risks) {
-  const rows = [["Name", "Email", "Student ID", "Section", "Status", "Started", "Submitted", "Violations",
-    "Risk level", "Risk score", "Risk reasons", "Flagged", "Score", "Max", "Percent", "Needs manual", "Note"]];
-  for (const s of sessions.values()) {
+/**
+ * The whole exam as one workbook: a summary a professor can hand in, the
+ * student rows, and an item analysis showing which questions the class found
+ * hard. Replaces the old single-sheet CSV.
+ */
+async function exportWorkbook(ex, sessions, grades, risks) {
+  const list = [...sessions.values()];
+  const graded = list.map((s) => grades.get(s.id)).filter(Boolean);
+  const pct = graded.map((g) => Number(g.percent)).filter(Number.isFinite);
+  const avg = pct.length ? pct.reduce((a, b) => a + b, 0) / pct.length : null;
+  const submitted = list.filter((s) => effectiveStatus(s, ex) === "submitted").length;
+
+  const summary = {
+    name: "Summary", headerRows: 0, cols: [30, 54],
+    rows: [
+      [{ v: ex.title || "Exam", s: XS.TITLE }],
+      [{ v: ex.course || "", s: XS.MUTED }],
+      [],
+      [{ v: "Exam code", s: XS.BOLD }, ex.code],
+      [{ v: "Professor", s: XS.BOLD }, ex.owner_name || ""],
+      [{ v: "Status", s: XS.BOLD }, ex.status],
+      [{ v: "Duration", s: XS.BOLD }, `${ex.duration_minutes} minutes`],
+      [{ v: "Questions", s: XS.BOLD }, ex.question_count ?? ""],
+      [{ v: "Total points", s: XS.BOLD }, Number(ex.total_points) || ""],
+      [{ v: "Scores released", s: XS.BOLD }, ex.scores_released ? "yes" : "no"],
+      [],
+      [{ v: "Students started", s: XS.BOLD }, list.length],
+      [{ v: "Submitted", s: XS.BOLD }, submitted],
+      [{ v: "Graded", s: XS.BOLD }, graded.length],
+      [{ v: "Class average", s: XS.BOLD }, avg == null ? "—" : { v: Math.round(avg * 10) / 10, s: XS.PERCENT }],
+      [{ v: "Flagged for review", s: XS.BOLD }, list.filter((s) => s.flagged).length],
+      [],
+      [{ v: "Exported", s: XS.BOLD }, new Date()],
+      [{ v: "", s: XS.MUTED }, { v: "Risk scores are a triage aid, not proof of cheating. Read the event log before acting on one.", s: XS.MUTED }],
+    ],
+  };
+
+  const students = {
+    name: "Students", filter: true,
+    cols: [24, 28, 14, 12, 13, 18, 18, 11, 10, 10, 40, 9, 9, 9, 9, 11, 30],
+    rows: [[
+      "Name", "E-mail", "Student no", "Section", "Status", "Started", "Submitted",
+      "Violations", "Risk", "Risk score", "Why flagged", "Flagged",
+      "Score", "Max", "Percent", "To grade", "Note",
+    ]],
+  };
+  const sorted = list.sort((a, b) => String(a.display_name || "").localeCompare(String(b.display_name || "")));
+  for (const s of sorted) {
     const g = grades.get(s.id), r = risks.get(s.id);
-    rows.push([s.display_name, s.email, s.student_no, s.section, effectiveStatus(s, ex),
-      s.started_at || "", s.submitted_at || "", s.violations || 0,
-      r?.level || "", r?.score ?? "", r?.reasons.join("; ") || "", s.flagged ? "yes" : "",
-      g?.score ?? "", g?.max_score ?? "", g?.percent ?? "", g?.needs_manual ?? "", s.note || ""]);
+    const riskStyle = r?.level === "high" ? XS.DANGER : r?.level === "medium" ? XS.WARN : XS.OK;
+    students.rows.push([
+      s.display_name || "", s.email || "", s.student_no || "", s.section || "",
+      effectiveStatus(s, ex),
+      s.started_at ? new Date(s.started_at) : "", s.submitted_at ? new Date(s.submitted_at) : "",
+      Number(s.violations) || 0,
+      r ? { v: r.level, s: riskStyle } : "", r ? Number(r.score) : "",
+      { v: r?.reasons.join("; ") || "", s: XS.WRAP },
+      s.flagged ? { v: "yes", s: XS.DANGER } : "",
+      g ? Number(g.score) : "", g ? Number(g.max_score) : "",
+      g ? { v: Number(g.percent), s: XS.PERCENT } : "",
+      g?.needs_manual ? { v: g.needs_manual, s: XS.WARN } : "",
+      { v: s.note || "", s: XS.WRAP },
+    ]);
   }
-  downloadText(`${ex.code}-${ex.title.replace(/[^a-z0-9]+/gi, "-")}-grades.csv`,
-    rows.map((r) => r.map(csvEscape).join(",")).join("\r\n"), "text/csv");
+
+  const sheets = [summary, students];
+
+  // Item analysis, when there is something to analyse. Per-question verdicts
+  // come back with the grade, so this costs one extra read for the prompts.
+  try {
+    const qs = await examQuestions(ex.code);
+    if (qs.length && graded.length) {
+      const rows = [["#", "Type", "Question", "Points", "Correct", "Partial", "Wrong", "Not answered", "% correct"]];
+      qs.forEach((q, i) => {
+        let ok = 0, part = 0, bad = 0, none = 0;
+        for (const g of graded) {
+          const v = g.per_question?.[q.id]?.verdict;
+          if (v === "correct") ok++;
+          else if (v === "partial") part++;
+          else if (v === "wrong") bad++;
+          else none++;
+        }
+        const answered = ok + part + bad;
+        const share = answered ? Math.round((ok / answered) * 1000) / 10 : null;
+        rows.push([i + 1, q.type, { v: q.prompt, s: XS.WRAP }, Number(q.points),
+          ok, part, bad, none,
+          share == null ? "" : { v: share, s: share < 40 ? XS.DANGER : share < 70 ? XS.WARN : XS.OK }]);
+      });
+      sheets.push({ name: "Item analysis", filter: true, cols: [5, 9, 70, 8, 9, 9, 8, 14, 11], rows });
+    }
+  } catch { /* the summary and student sheets are worth having on their own */ }
+
+  downloadXlsx(`${ex.code}-${(ex.title || "exam").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.xlsx`, sheets);
+  toast("Workbook downloaded.", "success");
 }
 
 // ----------------------------------------------------------------- access
@@ -1137,7 +1467,7 @@ function viewHelp(main) {
   main.append(h("div.card", { html: `
     <h1>How an exam runs</h1>
     <ol>
-      <li><strong>Create</strong> the exam (or import your question list), tick the anti-cheat settings, set the open/close window and <strong>Publish</strong>. You get a 6-character code.</li>
+      <li><strong>Create</strong> the exam — pick a preset, adjust what you want, set the open/close window and <strong>Publish</strong>. You get a 6-character code. Already have your questions in Excel? Use <strong>Import an exam</strong> on My exams and one file becomes a complete draft.</li>
       <li>Students sign in at the home page and enter the code. They confirm their details, accept the rules and click Start — the server records the start time.</li>
       <li>Open <strong>Live monitor</strong> during the exam. Rows update over a websocket: who is online, progress, time left, violations. You can <em>Unlock</em>, <em>add time</em>, <em>force-submit</em>, <em>terminate</em> or <em>reset</em> any student.</li>
       <li>Submissions are graded automatically by the database. Essay questions get points from the Review drawer.</li>
@@ -1151,6 +1481,18 @@ function viewHelp(main) {
       <li>Submitted, locked and terminated attempts are frozen. Violation counters can only go up. Only you can unlock, extend, terminate or reset.</li>
       <li>Grades are visible to a student only after you release them, and never another student's.</li>
     </ul>
+    <h3>Getting questions in and grades out</h3>
+    <p><strong>In:</strong> download the Excel template from any Import dialog. One row per question —
+      <code>Type</code> (mc, multi, tf, text, essay), <code>Points</code>, <code>Question</code>,
+      <code>Option A</code>…, and <code>Correct</code>. Correct is a letter for multiple choice
+      (<code>B</code>), several letters for multiple select (<code>A, C</code>), <code>TRUE</code>/<code>FALSE</code>
+      for true-false, and every accepted answer separated by <code>|</code> for short answer.
+      Column order does not matter, extra columns are ignored, and anything the importer is unsure about
+      is shown to you before it commits. A JSON bundle works too and round-trips exactly.</p>
+    <p><strong>Out:</strong> everything downloads as an Excel workbook. The grades export carries a summary
+      sheet, one row per student, and an item analysis showing which questions the class found hard.
+      Dates are real dates and scores are real numbers, so sorting and averaging work straight away.
+      Export an exam to Excel, edit it there, and import it back whenever you like.</p>
     <h3>Recorded as evidence — advisory, not proof</h3>
     <p>Tab switches, window blur, fullscreen exits, copy/paste, blocked shortcuts, suspected devtools, reloads, second tabs, offline gaps and suspiciously fast completion. Use <em>Analyse risk</em> and read the per-student event log; the risk score is a triage aid, not a verdict. No browser can see a second device or a person in the room — pair this with a visible proctor for high-stakes exams.</p>
   ` }));

@@ -13,6 +13,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { buildXlsx, readXlsx } from "../../js/xlsx.js";
+import { templateSheets, questionsFromTable } from "../../js/bundle.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const OUT = path.join(ROOT, "tests/smoke/out");
@@ -55,7 +57,36 @@ const browser = await chromium.launch(
 const FAKE_USER = { id: "00000000-0000-4000-8000-000000000001", email: "prof@example.edu",
   aud: "authenticated", role: "authenticated", email_confirmed_at: "2024-01-01T00:00:00Z" };
 
-async function stubSupabase(page, { session = null, rest = {} } = {}) {
+// --- a small exam a stubbed student can actually sit
+const STUDENT = { id: "00000000-0000-4000-8000-000000000009", email: "student@school.edu",
+  aud: "authenticated", role: "authenticated", email_confirmed_at: "2024-01-01T00:00:00Z" };
+const SID = "11111111-1111-4111-8111-111111111111";
+const opts = (a) => a.map((text, oi) => ({ oi, text }));
+const EXAM = {
+  code: "IAS101", title: "Information Assurance – Prelim Examination", course: "IAS 101",
+  owner_name: "Prof. Uno", instructions: "Answer every item. No notes, no second device.",
+  status: "open", opens_at: new Date(Date.now() - 3600e3).toISOString(),
+  closes_at: new Date(Date.now() + 30 * 86400e3).toISOString(),
+  duration_minutes: 60, max_violations: 5, violation_action: "lock",
+  require_fullscreen: false, block_clipboard: true, one_at_a_time: false,
+  require_student_id: true, scores_released: false, question_count: 4, total_points: 5,
+};
+const PAPER = [
+  { id: "q1", type: "mc", points: 1, prompt: "Which control most directly limits the damage of a stolen password?",
+    options: opts(["Password rotation", "Multi-factor authentication", "Longer passwords", "Account lockout"]) },
+  { id: "q2", type: "multi", points: 2, prompt: "Which of these are administrative controls?",
+    options: opts(["Security policy", "Firewall rule", "Staff training", "Door lock"]) },
+  { id: "q3", type: "tf", points: 1, prompt: "Encryption at rest protects data if a disk is stolen." },
+  { id: "q4", type: "text", points: 1, prompt: "Name the principle of giving a user only the access they need." },
+];
+const SESSION = {
+  id: SID, exam_code: "IAS101", student_id: STUDENT.id, display_name: "Dela Cruz, Juan",
+  student_no: "21-0001", section: "BSIT 3A", status: "in_progress", answers: {}, violations: 0,
+  started_at: new Date().toISOString(), heartbeat_at: new Date().toISOString(),
+  client_id: null, extra_minutes: 0, flagged: false,
+};
+
+async function stubSupabase(page, { session = null, rest = {}, rpc = {} } = {}) {
   await page.route("**/auth/v1/**", (route) => {
     const url = route.request().url();
     if (url.includes("/user")) {
@@ -69,8 +100,10 @@ async function stubSupabase(page, { session = null, rest = {} } = {}) {
     return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
   });
   await page.route("**/rest/v1/**", (route) => {
-    const table = new URL(route.request().url()).pathname.replace(/^.*\/rest\/v1\//, "").split("?")[0];
-    const body = Object.prototype.hasOwnProperty.call(rest, table) ? rest[table] : [];
+    const seg = new URL(route.request().url()).pathname.replace(/^.*\/rest\/v1\//, "").split("?")[0];
+    const src = seg.startsWith("rpc/") ? rpc : rest;
+    const key = seg.replace(/^rpc\//, "");
+    const body = Object.prototype.hasOwnProperty.call(src, key) ? src[key] : [];
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
   await page.route("**/realtime/v1/**", (route) => route.abort());
@@ -221,14 +254,123 @@ try {
   check("editor: the applied preset is highlighted",
     (await ed.locator('.preset[aria-pressed="true"]').count()) === 1);
 
+  // --- the import path, driven with a real workbook. This is the feature most
+  //     likely to meet a file we have never seen, so it gets a live round trip.
+  fs.mkdirSync(OUT, { recursive: true });
+  const tpl = path.join(OUT, "template.xlsx");
+  fs.writeFileSync(tpl, Buffer.from(await buildXlsx(templateSheets()).arrayBuffer()));
+
+  await ed.getByRole("button", { name: "⬆ Import a file" }).click();
+  await ed.locator(".dropzone").waitFor();
+  await ed.locator(".dropzone input[type=file]").setInputFiles(tpl);
+  await ed.locator(".import-status.ok").waitFor({ timeout: 8000 });
+  const report = await ed.locator(".import-status").innerText();
+  check("import: reads the workbook and reports what it found",
+    /5 questions/.test(report), report.replace(/\n/g, " | "));
+  check("import: names every question type it read",
+    /Multiple choice/.test(report) && /Essay/.test(report), report.replace(/\n/g, " | "));
+
+  await ed.locator(".modal-card select").selectOption("replace");
+  await ed.getByRole("button", { name: "Import", exact: true }).click();
+  await ed.locator(".modal-overlay").waitFor({ state: "detached" });
+  check("import: the questions land in the editor",
+    (await ed.locator(".q-row").count()) === 5, `${await ed.locator(".q-row").count()} rows`);
+  check("import: with their types intact",
+    (await ed.locator(".type-chip").allInnerTexts()).join(",") === "CHOICE,MULTI,T / F,SHORT,ESSAY",
+    (await ed.locator(".type-chip").allInnerTexts()).join(","));
+  check("import: nothing is left flagged as unfinished",
+    (await ed.locator(".q-flag.warn").count()) === 0,
+    `${await ed.locator(".q-flag.warn").count()} still warned`);
+  check("import: the points came across",
+    (await ed.locator(".q-row").last().innerText()).includes("10 pt"));
+
+  // ...and back out again: the Excel the editor writes must re-import cleanly.
+  const dl = await Promise.all([
+    ed.waitForEvent("download"),
+    ed.getByRole("button", { name: "⬇ Excel" }).click(),
+  ]).then(([d]) => d);
+  const saved = path.join(OUT, "exported.xlsx");
+  await dl.saveAs(saved);
+  check("export: the download is named after the exam",
+    /\.xlsx$/.test(dl.suggestedFilename()), dl.suggestedFilename());
+  const back = questionsFromTable(await readXlsx(fs.readFileSync(saved).buffer));
+  check("export: the exported workbook re-imports with no warnings",
+    back.warnings.length === 0, back.warnings.join(" | "));
+  check("export: and with every question and key intact",
+    back.questions.length === 5 && back.questions[0].key.correct === 1 &&
+    back.questions[2].key.correct === true &&
+    back.questions[3].key.accepted.length === 3,
+    JSON.stringify(back.questions.map((q) => q.key)));
+
   // the search box must narrow the list
-  await ed.locator(".q-toolbar input").fill("defence");
+  await ed.locator(".q-toolbar input").fill("least privilege");   // in the answer key, not the prompt
   check("editor: search narrows the question list",
-    (await ed.locator(".q-row").count()) === 1);
+    (await ed.locator(".q-row").count()) === 1, `${await ed.locator(".q-row").count()} rows`);
   await ed.locator(".q-toolbar input").fill("");
   check("editor: clearing the search restores every question",
-    (await ed.locator(".q-row").count()) === 2);
+    (await ed.locator(".q-row").count()) === 5);
   await editor.ctx.close();
+
+  // --- the student runner. Nothing else in this suite reaches the page a
+  //     student actually sits the exam on.
+  const studentOpts = {
+    session: { ...fakeSession(), user: STUDENT },
+    storageKey: `sb-${ref}-auth-token`,
+    rest: {
+      profiles: [{ id: STUDENT.id, email: STUDENT.email, role: "student",
+                   display_name: "Dela Cruz, Juan", student_id: "21-0001", section: "BSIT 3A" }],
+      sessions: [SESSION],
+    },
+    rpc: { exam_intro: EXAM, start_exam: SID, get_paper: PAPER, server_now: new Date().toISOString() },
+  };
+  const gate = await visit("exam gate (student)", "/exam.html?code=IAS101", studentOpts);
+  const gp = gate.page;
+  check("gate: names the exam before anything starts",
+    (await gp.locator("body").innerText()).includes("Information Assurance"));
+  check("gate: asks for consent before it will start",
+    (await gp.locator("button.btn-lg").isDisabled()));
+  await gp.locator(".card input[type=checkbox]").last().check();
+  check("gate: ticking the box arms the start button",
+    !(await gp.locator("button.btn-lg").isDisabled()));
+
+  await gp.locator("button.btn-lg").click();
+  await gp.locator(".q-card").first().waitFor({ timeout: 15000 });
+  check("exam: every question is on the page",
+    (await gp.locator(".q-card").count()) === 4, `${await gp.locator(".q-card").count()} cards`);
+  check("exam: multiple-choice options show their text",
+    (await gp.locator(".q-card").first().innerText()).includes("Multi-factor authentication"));
+  check("exam: true/false gets two options, not four",
+    (await gp.locator(".q-card").nth(2).locator(".option").count()) === 2);
+  check("exam: a short-answer question gets a text box",
+    (await gp.locator(".q-card").nth(3).locator("input.input").count()) === 1);
+
+  const timer = await gp.locator(".timer").innerText();
+  check("exam: the clock is running, not NaN", /^\d?\d:\d\d$/.test(timer.trim()), `timer read "${timer}"`);
+
+  check("exam: nothing is answered yet",
+    (await gp.locator(".exam-nav").innerText()).includes("0 of 4"),
+    await gp.locator(".exam-nav").innerText());
+  await gp.locator(".q-card").first().locator(".option").nth(1).click();
+  check("exam: picking an option marks it selected",
+    (await gp.locator(".q-card").first().locator(".option.selected").count()) === 1);
+  await gp.locator(".q-card").nth(3).locator("input.input").fill("least privilege");
+  check("exam: the progress counter follows the answers",
+    (await gp.locator(".exam-nav").innerText()).includes("2 of 4"),
+    await gp.locator(".exam-nav").innerText());
+  check("exam: the question map marks answered items",
+    (await gp.locator(".nav-grid button.answered").count()) === 2);
+
+  // Only one radio may hold an answer, or a student could score twice.
+  await gp.locator(".q-card").first().locator(".option").nth(2).click();
+  check("exam: choosing again replaces the first choice",
+    (await gp.locator(".q-card").first().locator(".option.selected").count()) === 1);
+
+  // The answer key must never reach the student's browser.
+  const html = await gp.content();
+  check("exam: no answer key is anywhere in the page",
+    !/\bcorrect\b|\baccepted\b|answer_key/i.test(html),
+    (html.match(/\bcorrect\b|\baccepted\b|answer_key/i) || [])[0] || "");
+  await gate.ctx.close();
 
   // --- the failure this test exists for: a hung auth call must not blank the page
   const hung = await browser.newContext();
@@ -243,6 +385,31 @@ try {
   } catch {}
   check("home still renders when the auth API never answers", recovered);
   await hung.close();
+
+  // --- a hang AFTER sign-in must also surface. The professor page used to
+  //     declare itself rendered before loading the profile, so a stalled
+  //     profile query left "Loading…" on screen with the watchdog satisfied.
+  const stalled = await browser.newContext();
+  const sp = await stalled.newPage();
+  await sp.route("**/auth/v1/**", (r) => {
+    const u = r.request().url();
+    if (u.includes("/user")) {
+      return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(FAKE_USER) });
+    }
+    return r.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+  });
+  // Playwright matches the most recently registered route first, so the
+  // catch-all must go on before the one that stalls.
+  await sp.route("**/rest/v1/**", (r) => r.fulfill({ status: 200, body: "[]", contentType: "application/json" }));
+  await sp.route("**/rest/v1/profiles**", () => { /* never answer */ });
+  await sp.addInitScript(([k, sess]) => {
+    try { localStorage.setItem(k, JSON.stringify(sess)); } catch {}
+  }, [`sb-${ref}-auth-token`, fakeSession()]);
+  await sp.goto(BASE + "/professor.html", { waitUntil: "load" });
+  const surfaced = await sp.locator("#bootError").waitFor({ timeout: 15000 }).then(() => true).catch(() => false);
+  check("a stalled query after sign-in surfaces an error, not a silent Loading…", surfaced,
+    surfaced ? "" : `body: ${(await sp.locator("body").innerText()).slice(0, 80)}`);
+  await stalled.close();
 
   // --- and a page whose script is missing must say so rather than hang
   const broken = await browser.newContext();
