@@ -79,6 +79,27 @@ const PAPER = [
   { id: "q3", type: "tf", points: 1, prompt: "Encryption at rest protects data if a disk is stolen." },
   { id: "q4", type: "text", points: 1, prompt: "Name the principle of giving a user only the access they need." },
 ];
+const CLASS = [
+  ["Bautista, Neil",  "21-0005", "BSIT 3B", "in_progress", 0, 12, null],
+  ["Dela Cruz, Juan", "21-0001", "BSIT 3A", "in_progress", 1, 30, null],
+  ["Lim, Andrea",     "21-0004", "BSIT 3A", "locked",      6, 44, null],
+  ["Reyes, Maria",    "21-0002", "BSIT 3A", "submitted",   0, 60, [52, 86.7, 0]],
+  ["Santos, Paolo",   "21-0003", "BSIT 3B", "submitted",   4, 58, [41, 68.3, 1]],
+].map(([display_name, student_no, section, status, violations, answered, g], i) => ({
+  id: `s${i}`, exam_code: "IAS101", student_id: `st${i}`, display_name, student_no, section,
+  email: `${display_name.split(",")[0].toLowerCase()}@school.edu`,
+  status, violations, answered, total: 60, answers: {}, flagged: violations > 3,
+  extra_minutes: 0, note: "", client_id: `c${i}`, client: {},
+  started_at: new Date(Date.now() - 1800e3).toISOString(),
+  heartbeat_at: new Date().toISOString(),
+  submitted_at: status === "submitted" ? new Date(Date.now() - 300e3).toISOString() : null,
+  grade: g,
+}));
+const CLASS_GRADES = CLASS.filter((s) => s.grade).map((s) => ({
+  session_id: s.id, exam_code: "IAS101", score: s.grade[0], max_score: 60,
+  percent: s.grade[1], needs_manual: s.grade[2], per_question: {}, feedback: "",
+}));
+
 const SESSION = {
   id: SID, exam_code: "IAS101", student_id: STUDENT.id, display_name: "Dela Cruz, Juan",
   student_no: "21-0001", section: "BSIT 3A", status: "in_progress", answers: {}, violations: 0,
@@ -158,6 +179,12 @@ async function visit(label, urlPath, opts = {}) {
   check(`${label}: no watchdog error panel`, bootError === 0);
   check(`${label}: placeholder replaced`, !stillLoading, stillLoading ? "still showing Loading…" : "");
   check(`${label}: no page errors`, errors.length === 0, errors.slice(0, 3).join(" | "));
+
+  // Element.append(null) prints the literal word on the page, and `cond ? node
+  // : null` is everywhere. This shipped twice before it was noticed.
+  const junk = bodyText.match(/(^|[\s>])(null|undefined|NaN|\[object Object\])([\s<]|$)/);
+  check(`${label}: nothing renders as null/undefined/NaN`, !junk,
+    junk ? `found "${junk[2]}" in: …${bodyText.slice(Math.max(0, junk.index - 40), junk.index + 40)}…` : "");
 
   if (!rendered || bootError || errors.length) {
     fs.mkdirSync(OUT, { recursive: true });
@@ -310,6 +337,37 @@ try {
   check("editor: clearing the search restores every question",
     (await ed.locator(".q-row").count()) === 5);
   await editor.ctx.close();
+
+  // --- the live monitor, with a class in it. Every row state at once, so the
+  //     null/undefined guard above sweeps the busiest screen in the app.
+  const mon = await visit("live monitor (professor)", "/professor.html#exam/IAS101/monitor", {
+    session: fakeSession(), storageKey: `sb-${ref}-auth-token`,
+    rest: {
+      profiles: [{ id: FAKE_USER.id, email: FAKE_USER.email, role: "professor", display_name: "Prof Uno" }],
+      exams: [{ ...EXAM, owner_id: FAKE_USER.id, owner_name: "Prof Uno" }],
+      sessions: CLASS, grades: CLASS_GRADES,
+    },
+    rpc: { exam_intro: EXAM, server_now: new Date().toISOString() },
+  });
+  const mp = mon.page;
+  await mp.locator(".table tbody tr").first().waitFor({ timeout: 10000 });
+  check("monitor: one row per student",
+    (await mp.locator(".table tbody tr").count()) === 5,
+    `${await mp.locator(".table tbody tr").count()} rows`);
+  check("monitor: counts the class correctly",
+    (await mp.locator(".stat").first().innerText()).startsWith("5"),
+    await mp.locator(".stat").first().innerText());
+  check("monitor: progress reads as a fraction, not undefined",
+    /\b\d+ \/ 60\b/.test(await mp.locator(".table").innerText()));
+  check("monitor: a locked student can be unlocked from the row",
+    (await mp.getByRole("button", { name: "Unlock" }).count()) === 1);
+  check("monitor: flagged students are marked",
+    (await mp.locator(".table tr.risk-high, .table tbody tr").count()) === 5);
+  await mp.locator("input[placeholder^='Filter']").fill("BSIT 3B");
+  check("monitor: the filter narrows the table",
+    (await mp.locator(".table tbody tr").count()) === 2,
+    `${await mp.locator(".table tbody tr").count()} rows`);
+  await mon.ctx.close();
 
   // --- the student runner. Nothing else in this suite reaches the page a
   //     student actually sits the exam on.

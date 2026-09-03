@@ -1,7 +1,7 @@
 import { siteConfig } from "./config.js";
 import { watchAuth, renderAuthPanel, logout, isVerified, resendVerification } from "./auth.js";
 import { myProfile, updateMyProfile, mySessions, myGrades } from "./db.js";
-import { $, h, esc, toast, fmtDate, clear } from "./ui.js";
+import { $, h, esc, toast, fmtDate, clear, mount } from "./ui.js";
 
 // tells the boot watchdog in the HTML that the module graph loaded
 window.__unoBooted = true;
@@ -21,7 +21,7 @@ watchAuth(async (user) => {
     app.innerHTML = `<div class="card"><div class="form-error">${esc(e.message)}</div></div>`;
     return;
   }
-  $("#topRight").append(
+  mount($("#topRight"),
     h("span.small.muted", user.email),
     profile?.role === "professor"
       ? h("a.btn.btn-sm.btn-primary", { href: "professor.html" }, "Dashboard") : null,

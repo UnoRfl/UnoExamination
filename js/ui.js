@@ -41,6 +41,21 @@ export function h(tag, attrs = {}, ...children) {
 
 export function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return el; }
 
+/**
+ * append() with h()'s rule about empty children.
+ *
+ * Element.append(null) renders the literal text "null" on the page, which is
+ * exactly what `cond ? node : null` produces on the false branch. h() already
+ * skips those; this is the same for an element you already have.
+ */
+export function mount(host, ...children) {
+  for (const c of children.flat(Infinity)) {
+    if (c == null || c === false) continue;
+    host.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return host;
+}
+
 let toastHost;
 export function toast(msg, kind = "info", ms = 3500) {
   if (!toastHost) { toastHost = h("div.toast-host"); document.body.append(toastHost); }

@@ -21,7 +21,7 @@ import {
 } from "./bundle.js";
 import {
   $, $$, h, esc, toast, dialog, confirmDialog, promptDialog, fmtDate, fmtTime, ago, mmss,
-  toDate, toLocalInput, clear, downloadText, examCode, randomId,
+  toDate, toLocalInput, clear, mount, downloadText, examCode, randomId,
 } from "./ui.js";
 
 // tells the boot watchdog in the HTML that the module graph loaded
@@ -231,7 +231,7 @@ async function importWholeExam() {
       if (!titleI.value) titleI.value = file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
       const pts = parsed.questions.reduce((n, q) => n + (Number(q.points) || 0), 0);
       status.classList.add(parsed.warnings.length ? "warn" : "ok");
-      status.append(
+      mount(status,
         h("div.is-head", parsed.warnings.length ? "⚠ Read with warnings" : "✓ Ready to import"),
         h("div.small", `${parsed.questions.length} questions · ${pts} points`),
         parsed.warnings.length ? h("ul.is-warns", parsed.warnings.slice(0, 6).map((w) => h("li", w))) : null,
@@ -720,7 +720,7 @@ async function viewEditor(main, code) {
         for (const q of parsed.questions) byType[q.type] = (byType[q.type] || 0) + 1;
         const pts = parsed.questions.reduce((n, q) => n + (Number(q.points) || 0), 0);
         status.classList.add(parsed.warnings.length ? "warn" : "ok");
-        status.append(
+        mount(status,
           h("div.is-head", parsed.warnings.length ? "⚠ Read with warnings" : "✓ Ready to import"),
           h("div.small", `${parsed.questions.length} questions · ${pts} points · from ${parsed.source}`),
           h("div.small.muted", Object.entries(byType)
@@ -934,7 +934,7 @@ async function viewMonitor(main, code) {
   const search = h("input.input", { placeholder: "Filter by name / e-mail / section…", style: { maxWidth: "300px" }, oninput: () => render() });
   const onlyFlag = h("input", { type: "checkbox", onchange: () => render() });
 
-  main.append(
+  mount(main,
     h("div.card-head",
       h("div", h("h1", ex.title),
         h("div.small.muted", `${ex.course || ""} · ${ex.duration_minutes} min · limit ${ex.max_violations} violations (${ex.violation_action})`)),
@@ -1118,7 +1118,7 @@ async function openDrawer(ex, s, grade, risks, onSaved) {
   tabs.firstChild.classList.add("active");
   eventsPane.hidden = infoPane.hidden = true;
 
-  answersPane.append(h("div.answer-review", paper.map((q, i) => {
+  mount(answersPane, h("div.answer-review", paper.map((q, i) => {
     const r = pq[q.id] || {};
     const cls = r.verdict === "correct" ? "ok" : r.verdict === "partial" ? "partial"
       : r.verdict === "wrong" ? "bad" : "manual";
@@ -1148,7 +1148,7 @@ async function openDrawer(ex, s, grade, risks, onSaved) {
   if (!paper.length) answersPane.append(h("div.empty", "No paper to show."));
 
   const counts = risk.counts || {};
-  eventsPane.append(
+  mount(eventsPane,
     h("div.row", { style: { marginBottom: ".6rem" } },
       ...Object.entries(counts).sort((a, b) => (EVENT_WEIGHTS[b[0]] || 0) - (EVENT_WEIGHTS[a[0]] || 0))
         .map(([t, n]) => h(`span.badge${(EVENT_WEIGHTS[t] || 0) >= 3 ? ".badge-danger" : (EVENT_WEIGHTS[t] || 0) >= 1 ? ".badge-warn" : ""}`,
@@ -1160,7 +1160,7 @@ async function openDrawer(ex, s, grade, risks, onSaved) {
   );
 
   const c = s.client || {};
-  infoPane.append(h("div.stack",
+  mount(infoPane,h("div.stack",
     kv("Session id", s.id), kv("E-mail", s.email), kv("Student ID", s.student_no || "—"),
     kv("Section", s.section || "—"), kv("Started", fmtDate(s.started_at)),
     kv("Submitted", fmtDate(s.submitted_at)), kv("Last heartbeat", fmtDate(s.heartbeat_at)),
@@ -1174,7 +1174,7 @@ async function openDrawer(ex, s, grade, risks, onSaved) {
   const feedback = h("textarea", { rows: 2, placeholder: "Feedback shown to the student with the score (optional)" }, g?.feedback || "");
   const note = h("textarea", { rows: 2, placeholder: "Private note (professors only)" }, s.note || "");
 
-  drawer.append(
+  mount(drawer,
     h("div.row.between",
       h("div", h("h2", s.display_name || s.email), h("div.small.muted", s.email), statusBadge(effectiveStatus(s, ex))),
       h("button.btn.btn-ghost", { onclick: close }, "✕ Close")),
