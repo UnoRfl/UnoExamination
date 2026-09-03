@@ -416,3 +416,13 @@ details.group .group-body { padding: 0 .9rem 1rem; border-top: 1px solid var(--b
 .import-status.warn .is-head { color: var(--warn); }
 .import-status.bad .is-head { color: var(--danger); }
 .import-status .is-warns { margin: .5rem 0 0; padding-left: 1.1rem; font-size: .83rem; line-height: 1.6; max-height: 11rem; overflow: auto; }
+
+/* ===== Bulk actions on the live monitor ================================= */
+/* Appears only when rows are ticked, so the toolbar stays quiet otherwise. */
+.bulk-bar {
+  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  padding: .6rem .85rem; margin-bottom: .7rem; border-radius: var(--radius-sm);
+  background: var(--primary-soft); border: 1px solid var(--primary);
+  animation: rise .15s ease-out;
+}
+.bulk-bar strong { color: var(--primary); }

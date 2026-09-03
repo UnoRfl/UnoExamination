@@ -23,7 +23,7 @@ watchAuth(async (user) => {
   }
   mount($("#topRight"),
     h("span.small.muted", user.email),
-    profile?.role === "professor"
+    ["professor", "admin"].includes(profile?.role)
       ? h("a.btn.btn-sm.btn-primary", { href: "professor.html" }, "Dashboard") : null,
     h("button.btn.btn-sm", { onclick: () => logout() }, "Sign out"),
   );

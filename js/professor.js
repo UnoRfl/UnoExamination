@@ -5,8 +5,11 @@
 import { siteConfig } from "./config.js";
 import { watchAuth, renderAuthPanel, logout } from "./auth.js";
 import {
-  myProfile, claimProfessor, setRoleByEmail, listProfessors,
-  myExams, getExam, saveExam, deleteExam,
+  myProfile, claimProfessor, setRoleByEmail, listStaff,
+  myExams, getExam, saveExam, deleteExam, allExams,
+  examTeachers, addTeacher, removeTeacher,
+  examRoster, rosterUpsert, rosterRemove,
+  sectionStats, resetSessions, staffOverview, adminStats,
   examQuestions, examQuestionsWithKeys, replaceQuestions,
   examSessions, sessionEvents, profUpdateSession, resetSession, getPaper,
   gradeExam, gradeSession, setOverride, setFeedback, examGrades, releaseScores,
@@ -16,9 +19,10 @@ import { QUESTION_TYPES, validateQuestion, validateKey, paperMaxPoints } from ".
 import { riskScore, EVENT_WEIGHTS } from "./grading.js";
 import { downloadXlsx, readTable, S as XS } from "./xlsx.js";
 import {
-  toBundle, toQuestionSheet, templateSheets, BUNDLE_SETTINGS,
-  questionsFromTable, fromBundleJson,
+  toBundle, toQuestionSheet, templateSheets, BUNDLE_SETTINGS, EXAM_TYPES,
+  questionsFromTable, fromBundleJson, rosterFromTable, rosterFromText,
 } from "./bundle.js";
+import { parseDocumentFile, parseDocument } from "./docimport.js";
 import {
   $, $$, h, esc, toast, dialog, confirmDialog, promptDialog, fmtDate, fmtTime, ago, mmss,
   toDate, toLocalInput, clear, mount, downloadText, examCode, randomId,
@@ -60,7 +64,9 @@ watchAuth(async (user) => {
     h("a.btn.btn-sm", { href: "./" }, "Student view"),
     h("button.btn.btn-sm", { onclick: () => logout() }, "Sign out"),
   );
-  if (P.profile?.role !== "professor") return renderNotProfessor(user);
+  // An administrator runs exams too — the extra tab is the only difference.
+  if (!["professor", "admin"].includes(P.profile?.role)) return renderNotProfessor(user);
+  if (P.profile.role === "admin") $("#roleBadge").textContent = "Administrator";
   window.addEventListener("hashchange", route);
   route();
 });
@@ -107,6 +113,7 @@ function route() {
     code ? link(`#exam/${code}/grades`, "🎯 Grades", sub === "grades") : null,
     h("div.spacer"),
     link("#access", "👥 Access", view === "access"),
+    P.profile?.role === "admin" ? link("#admin", "🛡 Admin", view === "admin") : null,
     link("#help", "❔ Help", view === "help"),
   );
   const main = h("main.main");
@@ -119,10 +126,170 @@ function route() {
     return viewEditor(main, code);
   }
   if (view === "access") return viewAccess(main);
+  if (view === "admin") return viewAdmin(main);
   if (view === "help") return viewHelp(main);
   viewExams(main);
 }
 const link = (href, label, active) => h("a", { href, class: active ? "active" : "" }, label);
+
+// ---------------------------------------------------------------- super admin
+/**
+ * What a super administrator can do that a professor cannot: see every exam in
+ * the installation, see who the staff are and what they are running, and
+ * decide who holds which role — including who else becomes an administrator.
+ */
+async function viewAdmin(main) {
+  if (P.profile?.role !== "admin") {
+    return main.append(h("div.card", h("h1", "Administrators only"),
+      h("p.muted", "Ask an administrator if you need access to this tab.")));
+  }
+  const statHost = h("div.grid.grid-3",
+    { style: { gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", marginBottom: "1rem" } });
+  const staffHost = h("div");
+  const examHost = h("div");
+  const examFilter = h("input.input", { placeholder: "Filter by title, code, course or teacher…",
+    style: { maxWidth: "320px" }, oninput: () => drawExams() });
+  let exams = [];
+
+  main.append(
+    h("div.card-head", h("div", h("h1", "Administration"),
+      h("div.small.muted", "Everything on this site, across every professor")),
+      h("span.badge.badge-primary", "super admin")),
+    statHost,
+    h("div.card",
+      h("div.card-head", h("h3", "Staff"),
+        h("button.btn.btn-sm", { onclick: addStaffDialog }, "＋ Add a professor")),
+      h("p.help", { style: { marginTop: 0 } },
+        "Anyone listed here can create and run exams. An administrator can additionally see " +
+        "every exam and change roles. People must sign in once before they can be given a role."),
+      staffHost),
+    h("div.card",
+      h("div.card-head", h("div", h("h3", "All exams")),
+        h("div.row", examFilter)),
+      examHost),
+  );
+
+  load();
+
+  async function load() {
+    clear(statHost); clear(staffHost);
+    statHost.append(h("p.muted.small", "Loading…"));
+    try {
+      const [stats, staff, all] = await Promise.all([adminStats(), staffOverview(), allExams()]);
+      exams = all || [];
+      clear(statHost);
+      const tile = (n, l, tone) => h("div.stat",
+        h("div.n", { style: tone ? { color: `var(--${tone})` } : {} }, String(n)), h("div.l", l));
+      statHost.append(
+        tile(stats.students, "Students"),
+        tile(stats.professors, "Professors"),
+        tile(stats.admins, "Administrators"),
+        tile(stats.exams, "Exams"),
+        tile(stats.open_exams, "Open now", stats.open_exams ? "success" : null),
+        tile(stats.in_progress, "Sitting now", stats.in_progress ? "accent" : null),
+        tile(stats.sessions, "Attempts"),
+        tile(stats.graded, "Graded"),
+      );
+      drawStaff(staff || []);
+      drawExams();
+    } catch (e) {
+      clear(statHost);
+      statHost.append(h("div.form-error", e.friendly || e.message));
+    }
+  }
+
+  function drawStaff(staff) {
+    clear(staffHost);
+    if (!staff.length) return staffHost.append(h("div.empty", "No staff yet."));
+    const tb = h("tbody");
+    for (const u of staff) {
+      const me = u.id === P.user.id;
+      tb.append(h("tr",
+        h("td", h("strong", u.display_name), me ? h("span.badge", { style: { marginLeft: ".4rem" } }, "you") : null,
+          h("div.small.muted", u.email)),
+        h("td", u.role === "admin"
+          ? h("span.badge.badge-primary", "administrator")
+          : h("span.badge", "professor")),
+        h("td", String(u.exams_owned)),
+        h("td", u.open_exams ? h("strong", { style: { color: "var(--success)" } }, String(u.open_exams)) : "0"),
+        h("td", String(u.exams_shared)),
+        h("td", { style: { textAlign: "right" } }, me ? h("span.muted.small", "—") : h("div.row", { style: { justifyContent: "flex-end" } },
+          u.role === "professor"
+            ? h("button.btn.btn-sm", { title: "Give them full administration rights",
+                onclick: () => setRole(u, "admin",
+                  `${u.display_name} will be able to see every exam on this site and change anyone's role.`) },
+                "Make admin")
+            : h("button.btn.btn-sm", { onclick: () => setRole(u, "professor",
+                `${u.display_name} keeps their own exams but loses site-wide access.`) },
+                "Make professor"),
+          h("button.btn.btn-sm", { style: { color: "var(--danger)" },
+            onclick: () => setRole(u, "student",
+              `${u.display_name} becomes a student account. Exams they own stay, but they will not be able to open them.`) },
+            "Remove staff")))));
+    }
+    staffHost.append(h("div.table-wrap", h("table.table",
+      h("thead", h("tr", h("th", "Person"), h("th", "Role"), h("th", "Exams"),
+        h("th", "Open"), h("th", "Co-teaching"), h("th", ""))), tb)));
+  }
+
+  async function setRole(u, role, warning) {
+    if (!await confirmDialog(`Change ${esc(u.display_name)}'s role?`, warning,
+      "Change role", role === "student" ? "danger" : "primary")) return;
+    try {
+      await setRoleByEmail(u.email, role);
+      toast(`${u.email} is now a ${role}.`, "success");
+      load();
+    } catch (e) { toast(e.friendly || e.message, "error", 6000); }
+  }
+
+  async function addStaffDialog() {
+    const email = h("input.input", { type: "email", placeholder: "colleague@university.edu" });
+    const asAdmin = h("input", { type: "checkbox" });
+    const ok = await dialog({
+      title: "Add a professor",
+      body: h("div.stack",
+        h("p.help", { style: { marginTop: 0 } },
+          "They must sign in to this site once first — that is what creates their account."),
+        h("label.field", h("span", "Their e-mail"), email),
+        h("label.check", asAdmin, h("span", "Make them an administrator too"))),
+      buttons: [{ label: "Cancel", value: false }, { label: "Add", value: true, kind: "primary" }],
+    });
+    if (!ok || !email.value.trim()) return;
+    try {
+      await setRoleByEmail(email.value.trim(), asAdmin.checked ? "admin" : "professor");
+      toast("Added.", "success");
+      load();
+    } catch (e) { toast(e.friendly || e.message, "error", 6000); }
+  }
+
+  function drawExams() {
+    clear(examHost);
+    const q = examFilter.value.trim().toLowerCase();
+    const list = exams.filter((e) => !q ||
+      `${e.title} ${e.code} ${e.course} ${e.owner_name}`.toLowerCase().includes(q));
+    if (!list.length) {
+      return examHost.append(h("div.empty", exams.length
+        ? "No exam matches that." : "No exams have been created yet."));
+    }
+    const tb = h("tbody");
+    for (const e of list) {
+      tb.append(h("tr",
+        h("td", h("strong", e.title),
+          h("div.small.muted", [e.course, EXAM_TYPES[e.exam_type] || e.exam_type].filter(Boolean).join(" · "))),
+        h("td", h("code", e.code)),
+        h("td", e.owner_name || h("span.muted", "—")),
+        h("td", statusBadge(e.status)),
+        h("td", `${e.question_count ?? 0}`),
+        h("td", ago(e.updated_at)),
+        h("td", { style: { textAlign: "right" } }, h("div.row", { style: { justifyContent: "flex-end" } },
+          h("a.btn.btn-sm", { href: `#exam/${e.code}/monitor` }, "Monitor"),
+          h("a.btn.btn-sm", { href: `#exam/${e.code}/grades` }, "Grades")))));
+    }
+    examHost.append(h("div.table-wrap", h("table.table",
+      h("thead", h("tr", h("th", "Exam"), h("th", "Code"), h("th", "Owner"), h("th", "Status"),
+        h("th", "Items"), h("th", "Updated"), h("th", ""))), tb)));
+  }
+}
 
 // ---------------------------------------------------------------- helpers
 const statusBadge = (st) => {
@@ -310,6 +477,8 @@ async function viewEditor(main, code) {
 
   let sessionCount = 0;
   if (code) { try { sessionCount = (await examSessions(code)).length; } catch {} }
+  // A co-teacher may run the exam but not give it away or delete it.
+  const isOwner = !code || ex.owner_id === P.user.id || P.profile?.role === "admin";
 
   const f = {
     title: h("input.input", { value: ex.title, placeholder: "e.g. Information Assurance – Prelim Examination", required: true }),
@@ -324,8 +493,10 @@ async function viewEditor(main, code) {
       .map(([v, l]) => h("option", { value: v, selected: ex.violation_action === v }, l))),
     questions_per_student: h("input.input", { type: "number", min: 0, value: ex.questions_per_student || 0 }),
     allowed_domain: h("input.input", { value: ex.allowed_domain || "", placeholder: "e.g. perpetualdalta.edu.ph (blank = any)" }),
-    roster: h("textarea", { rows: 3, placeholder: "student1@school.edu\nstudent2@school.edu" },
-      (ex.roster || []).join("\n")),
+    exam_type: h("select", Object.entries(EXAM_TYPES)
+      .map(([v, l]) => h("option", { value: v, selected: (ex.exam_type || "quiz") === v }, l))),
+    passing_percent: h("input.input", { type: "number", min: 0, max: 100, step: 1,
+      value: ex.passing_percent ?? 60 }),
     require_fullscreen: sw("Require fullscreen", "The paper opens fullscreen. Leaving it is recorded.", ex.require_fullscreen),
     block_clipboard: sw("Block copy & paste", "Stops questions being pasted into a chat or search box.", ex.block_clipboard),
     shuffle_questions: sw("Shuffle question order", "Each student gets the questions in a different order.", ex.shuffle_questions),
@@ -341,10 +512,11 @@ async function viewEditor(main, code) {
     l.input = i;
     return l;
   }
-  for (const k of ["duration_minutes", "max_violations", "questions_per_student", "allowed_domain"])
+  for (const k of ["duration_minutes", "max_violations", "questions_per_student",
+                   "allowed_domain", "passing_percent"])
     f[k].addEventListener("input", () => refreshSummary());
-  f.violation_action.addEventListener("change", () => refreshSummary());
-  f.roster.addEventListener("input", () => refreshSummary());
+  for (const k of ["violation_action", "exam_type"])
+    f[k].addEventListener("change", () => refreshSummary());
 
   // --- Presets. Most professors want one of three postures, not seven decisions.
   const PRESETS = [
@@ -388,11 +560,12 @@ async function viewEditor(main, code) {
     const per = Math.max(0, parseInt(f.questions_per_student.value) || 0);
     const lim = Math.max(1, parseInt(f.max_violations.value) || 1);
     const act = ACTION_WORD[f.violation_action.value] || f.violation_action.value;
-    const rosterCount = f.roster.value.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean).length;
+    const rosterCount = roster.length;
     const domain = f.allowed_domain.value.trim().replace(/^@/, "");
 
     clear(summary);
     const bits = [
+      [null, EXAM_TYPES[f.exam_type.value] || "Exam"],
       [String(mins), " min"],
       [String(per || questions.length), per ? ` of ${questions.length} questions each` : " questions"],
       [null, on("require_fullscreen") ? "fullscreen" : "windowed"],
@@ -411,9 +584,213 @@ async function viewEditor(main, code) {
     const dbits = [on("shuffle_questions") && "questions shuffled", on("shuffle_options") && "options shuffled",
                    on("one_at_a_time") && "one at a time", per && `${per} per student`].filter(Boolean);
     note.delivery.textContent = dbits.length ? dbits.join(", ") : "everyone gets the same paper";
-    note.access.textContent = rosterCount ? `${rosterCount} on the roster`
+    const secs = new Set(roster.map((r) => (r.section || "").trim()).filter(Boolean)).size;
+    note.access.textContent = rosterCount
+      ? `${rosterCount} on the roster${secs ? ` · ${secs} section${secs === 1 ? "" : "s"}` : ""}`
       : domain ? `anyone @${domain}` : "anyone with the code";
     note.after.textContent = on("show_correct_answers") ? "answers revealed on release" : "scores only";
+  }
+
+  // ---- roster: who is allowed to sit this exam, with their details
+  //
+  // The roster is authoritative for a student's number and section, so bulk
+  // adding a class list also fixes the "everyone typed their section slightly
+  // differently" problem that made per-section scores useless.
+  let roster = [];
+  const rosterHost = h("div");
+  const rosterCountEl = h("span.small.muted");
+
+  const drawRoster = () => {
+    clear(rosterHost);
+    rosterCountEl.textContent = roster.length
+      ? `${roster.length} student${roster.length === 1 ? "" : "s"} · ${
+          new Set(roster.map((r) => r.section || "—")).size} section(s)`
+      : "empty — anyone with the code may sit this exam";
+    if (!roster.length) {
+      rosterHost.append(h("div.empty",
+        "No roster. Add your class list to restrict who can start, and to fix everyone's section."));
+      return;
+    }
+    const rows = h("tbody");
+    for (const r of roster) {
+      rows.append(h("tr",
+        h("td", h("strong", r.display_name || h("span.muted", "—"))),
+        h("td", r.email),
+        h("td", r.student_no || ""),
+        h("td", r.section || ""),
+        h("td", { style: { textAlign: "right" } },
+          h("button.btn.btn-sm.btn-ghost", { title: "Remove from roster",
+            style: { color: "var(--danger)" },
+            onclick: async () => {
+              if (!ex.code) { roster = roster.filter((x) => x.email !== r.email); return drawRoster(); }
+              try {
+                await rosterRemove(ex.code, [r.email]);
+                roster = roster.filter((x) => x.email !== r.email);
+                drawRoster(); refreshSummary();
+              } catch (e) { toast(e.friendly || e.message, "error"); }
+            } }, "✕"))));
+    }
+    rosterHost.append(h("div.table-wrap", h("table.table",
+      h("thead", h("tr", h("th", "Name"), h("th", "E-mail"), h("th", "Student no"),
+        h("th", "Section"), h("th", ""))), rows)));
+  };
+
+  /** Saves rows to the server when the exam exists, or holds them until it does. */
+  async function addToRoster(rows) {
+    const clean = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const email = String(r.email || "").trim().toLowerCase();
+      if (!email.includes("@") || seen.has(email)) continue;
+      seen.add(email);
+      clean.push({ email,
+        display_name: String(r.display_name || "").trim(),
+        student_no: String(r.student_no || "").trim(),
+        section: String(r.section || "").trim() });
+    }
+    if (!clean.length) throw new Error("No usable e-mail addresses were found.");
+    if (ex.code) await rosterUpsert(ex.code, clean);
+    const byEmail = new Map(roster.map((r) => [r.email, r]));
+    for (const r of clean) byEmail.set(r.email, { ...byEmail.get(r.email), ...r });
+    roster = [...byEmail.values()].sort((a, b) =>
+      (a.section || "").localeCompare(b.section || "") ||
+      (a.display_name || a.email).localeCompare(b.display_name || b.email));
+    drawRoster(); refreshSummary();
+    return clean.length;
+  }
+
+  async function addStudentDialog() {
+    const email = h("input.input", { type: "email", placeholder: "student@school.edu", required: true });
+    const name = h("input.input", { placeholder: "Last Name, First Name" });
+    const no = h("input.input", { placeholder: "21-0001" });
+    const sec = h("input.input", { placeholder: "BSIT 3A",
+      value: roster.length ? roster[roster.length - 1].section || "" : "" });
+    const ok = await dialog({
+      title: "Add a student",
+      body: h("div.stack",
+        h("label.field", h("span", "E-mail *"), email,
+          h("span.help", "Must match the address they sign in with.")),
+        h("div.grid.grid-2",
+          h("label.field", h("span", "Name"), name),
+          h("label.field", h("span", "Student number"), no)),
+        h("label.field", h("span", "Section"), sec)),
+      buttons: [{ label: "Cancel", value: false }, { label: "Add", value: true, kind: "primary" }],
+    });
+    if (!ok) return;
+    try {
+      await addToRoster([{ email: email.value, display_name: name.value,
+                           student_no: no.value, section: sec.value }]);
+      toast("Added to the roster.", "success");
+    } catch (e) { toast(e.friendly || e.message, "error", 6000); }
+  }
+
+  async function bulkAddDialog() {
+    const { zone, input } = dropZone("Excel (.xlsx), CSV, or paste below");
+    const ta = h("textarea", { rows: 7, style: { fontFamily: "var(--mono)", fontSize: ".8rem" },
+      placeholder: "juan@school.edu, Dela Cruz Juan, 21-0001, BSIT 3A\nmaria@school.edu, Reyes Maria, 21-0002, BSIT 3A\n\nOne student per line. E-mail first; name, number and section are optional." });
+    const sec = h("input.input", { placeholder: "e.g. BSIT 3A — leave blank to read it from the file" });
+    const status = h("div.import-status", { hidden: true });
+    let rows = null;
+
+    const preview = async (file) => {
+      status.hidden = false; clear(status); status.className = "import-status";
+      try {
+        rows = file ? rosterFromTable(await readTable(file)) : rosterFromText(ta.value);
+        if (sec.value.trim()) rows = rows.map((r) => ({ ...r, section: r.section || sec.value.trim() }));
+        if (!rows.length) throw new Error("No e-mail addresses were found.");
+        const sections = [...new Set(rows.map((r) => r.section).filter(Boolean))];
+        const named = rows.filter((r) => r.display_name).length;
+        status.classList.add("ok");
+        status.append(
+          h("div.is-head", `✓ ${rows.length} student${rows.length === 1 ? "" : "s"}`),
+          h("div.small", `${named} with a name · ${
+            sections.length ? sections.join(", ") : "no section given"}`),
+          h("div.small.muted", rows.slice(0, 3).map((r) => r.email).join(", ")
+            + (rows.length > 3 ? `, …and ${rows.length - 3} more` : "")));
+      } catch (e) {
+        rows = null;
+        status.classList.add("bad");
+        status.append(h("div.is-head", "Could not read that"), h("div.small", e.message));
+      }
+    };
+    input.onchange = () => {
+      const f2 = input.files?.[0];
+      if (!f2) return;
+      zone.classList.add("filled");
+      zone.querySelector(".dz-main").textContent = f2.name;
+      zone.querySelector(".dz-sub").textContent = "click to change";
+      preview(f2);
+    };
+    ta.oninput = () => { if (!input.files?.length && ta.value.trim()) preview(null); };
+
+    const ok = await dialog({
+      title: "Add students in bulk",
+      wide: true,
+      body: h("div.stack",
+        h("p.help", { style: { marginTop: 0 } },
+          "Any sheet with an e-mail column works — a class list exported from your registrar, " +
+          "or four columns pasted below. Existing students are updated, not duplicated."),
+        zone,
+        h("details.group", h("summary", "…or paste the list"), h("div.group-body", ta)),
+        h("label.field", h("span", "Put everyone in this section"), sec,
+          h("span.help", "Only fills the gaps — a section already in the file wins.")),
+        status),
+      buttons: [{ label: "Cancel", value: false }, { label: "Add to roster", value: true, kind: "primary" }],
+    });
+    if (!ok) return;
+    if (!rows) { await preview(input.files?.[0] || null); if (!rows) return; }
+    try {
+      const n = await addToRoster(rows);
+      toast(`${n} student${n === 1 ? "" : "s"} on the roster.`, "success");
+    } catch (e) { toast(e.friendly || e.message, "error", 6000); }
+  }
+
+  // ---- co-teachers
+  let teachers = [];
+  const teacherHost = h("div");
+  const drawTeachers = () => {
+    clear(teacherHost);
+    if (!teachers.length) return teacherHost.append(h("p.muted.small", "Just you."));
+    for (const t of teachers) {
+      teacherHost.append(h("div.row.between",
+        { style: { padding: ".45rem 0", borderBottom: "1px solid var(--border)" } },
+        h("div", h("strong", t.display_name),
+          h("div.small.muted", t.email, t.role === "admin" ? " · administrator" : "")),
+        t.is_owner
+          ? h("span.badge.badge-primary", "owner")
+          : (isOwner
+              ? h("button.btn.btn-sm", { onclick: async () => {
+                  if (!await confirmDialog("Remove teacher?",
+                    `${esc(t.display_name)} will lose access to this exam's students and grades.`,
+                    "Remove")) return;
+                  try {
+                    await removeTeacher(ex.code, t.id);
+                    teachers = teachers.filter((x) => x.id !== t.id);
+                    drawTeachers(); toast("Removed.", "success");
+                  } catch (e) { toast(e.friendly || e.message, "error"); }
+                } }, "Remove")
+              : h("span.badge", "teacher"))));
+    }
+  };
+
+  async function addTeacherDialog() {
+    const email = h("input.input", { type: "email", placeholder: "colleague@university.edu" });
+    const ok = await dialog({
+      title: "Add a teacher",
+      body: h("div.stack",
+        h("p.help", { style: { marginTop: 0 } },
+          "They will be able to monitor this exam, grade it and export it — but not delete it, " +
+          "and not add or remove other teachers. They must already be a professor on this site."),
+        h("label.field", h("span", "Their e-mail"), email)),
+      buttons: [{ label: "Cancel", value: false }, { label: "Add", value: true, kind: "primary" }],
+    });
+    if (!ok || !email.value.trim()) return;
+    try {
+      await addTeacher(ex.code, email.value.trim());
+      teachers = await examTeachers(ex.code);
+      drawTeachers();
+      toast("Teacher added.", "success");
+    } catch (e) { toast(e.friendly || e.message, "error", 7000); }
   }
 
   const qHost = h("div#qHost");
@@ -645,7 +1022,8 @@ async function viewEditor(main, code) {
       require_student_id: f.require_student_id.input.checked,
       show_correct_answers: f.show_correct_answers.input.checked,
       allowed_domain: f.allowed_domain.value.trim().toLowerCase().replace(/^@/, ""),
-      roster: f.roster.value.split(/[\n,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
+      exam_type: f.exam_type.value,
+      passing_percent: Math.max(0, Math.min(100, Number(f.passing_percent.value) || 60)),
       question_count: questions.length,
       total_points: perStudent ? Math.round(perQ * perStudent * 100) / 100 : paperMaxPoints(questions),
       updated_at: new Date().toISOString(),
@@ -662,11 +1040,12 @@ async function viewEditor(main, code) {
   }
 
   // ---- one file in, a whole paper out
-  const dropZone = () => {
+  const dropZone = (sub = "Excel (.xlsx), CSV, a JSON bundle, or a Word/PDF paper",
+                    accept = ".xlsx,.xlsm,.csv,.tsv,.txt,.json,.js,.docx,.pdf,.md,.html") => {
     const zone = h("div.dropzone", h("div.dz-icon", "📄"),
       h("div.dz-main", "Drop a file here, or click to choose"),
-      h("div.dz-sub", "Excel (.xlsx), CSV, or a JSON exam bundle"));
-    const input = h("input", { type: "file", accept: ".xlsx,.xlsm,.csv,.tsv,.txt,.json,.js", hidden: true });
+      h("div.dz-sub", sub));
+    const input = h("input", { type: "file", accept, hidden: true });
     zone.append(input);
     zone.onclick = () => input.click();
     zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("over"); };
@@ -686,13 +1065,25 @@ async function viewEditor(main, code) {
   async function readExamFile(file, pastedText) {
     if (!file && !String(pastedText || "").trim()) throw new Error("Choose a file, or paste your questions in the box.");
     if (!file) {
-      const b = fromBundleJson(pastedText);
-      return { settings: b.exam, questions: b.questions, warnings: b.warnings, source: "pasted text" };
+      const t = String(pastedText).trim();
+      // JSON is the documented paste format; anything else is a paper.
+      if (t.startsWith("{") || t.startsWith("[") || /baseQuizData/.test(t)) {
+        const b = fromBundleJson(t);
+        return { settings: b.exam, questions: b.questions, warnings: b.warnings, source: "pasted text" };
+      }
+      const d = parseDocument(t);
+      return { settings: {}, questions: d.questions, warnings: d.warnings, source: "pasted paper" };
     }
     const name = file.name.toLowerCase();
     if (name.endsWith(".json") || name.endsWith(".js")) {
       const b = fromBundleJson(await file.text());
       return { settings: b.exam, questions: b.questions, warnings: b.warnings, source: file.name };
+    }
+    // A paper the professor already wrote: read the questions out of it.
+    if (/\.(docx|pdf|md|html?|txt)$/.test(name)) {
+      const d = await parseDocumentFile(file);
+      return { settings: {}, questions: d.questions, warnings: d.warnings,
+               source: `${file.name} (read as a document)` };
     }
     // A spreadsheet: the first sheet is the questions, a "Settings" sheet is
     // optional. readTable only gives us sheet 1, so settings come from the
@@ -705,7 +1096,7 @@ async function viewEditor(main, code) {
   async function importDialog() {
     const { zone, input } = dropZone();
     const ta = h("textarea", { rows: 6, style: { fontFamily: "var(--mono)", fontSize: ".78rem" },
-      placeholder: '{ "exam": { "title": "Prelim" }, "questions": [ { "type": "mc", "prompt": "…", "options": ["a","b"], "correct": 1 } ] }' });
+      placeholder: '1. Which control limits the damage of a stolen password?\nA. Rotation\nB. Multi-factor authentication\nAnswer: B\n\n…or a JSON bundle.' });
     const status = h("div.import-status", { hidden: true });
     const mode = h("select",
       h("option", { value: "append" }, "Add to the questions already here"),
@@ -752,11 +1143,12 @@ async function viewEditor(main, code) {
       wide: true,
       body: h("div.stack",
         h("p.help", { style: { marginTop: 0 } },
-          "Bring in a whole paper at once. Never made one before? ",
+          "Bring in a whole paper at once — a Word document or PDF you already wrote, a " +
+          "question sheet, or a JSON bundle. Starting from scratch? ",
           h("a", { href: "#", onclick: (e) => { e.preventDefault(); downloadTemplate(); } },
-            "Download the Excel template"), " — it has one worked example of every question type."),
+            "Download the Excel template"), "."),
         zone,
-        h("details.group", h("summary", "…or paste JSON / the old quiz array"), h("div.group-body", ta)),
+        h("details.group", h("summary", "…or paste the paper, or JSON"), h("div.group-body", ta)),
         status,
         h("label.field", h("span", "Where do they go?"), mode)),
       buttons: [{ label: "Cancel", value: false }, { label: "Import", value: true, kind: "primary" }],
@@ -793,7 +1185,9 @@ async function viewEditor(main, code) {
       duration_minutes: Number(f.duration_minutes.value), max_violations: Number(f.max_violations.value),
       violation_action: f.violation_action.value, questions_per_student: Number(f.questions_per_student.value),
       allowed_domain: f.allowed_domain.value.trim(),
-      roster: f.roster.value.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean) };
+      exam_type: f.exam_type.value,
+      passing_percent: Number(f.passing_percent.value) || 60,
+      roster: roster.map((r) => r.email) };
     for (const k of ["require_fullscreen", "block_clipboard", "shuffle_questions", "shuffle_options",
       "one_at_a_time", "require_student_id", "show_correct_answers"]) row[k] = f[k].input.checked;
     return row;
@@ -824,10 +1218,25 @@ async function viewEditor(main, code) {
         h("label.field", h("span", "Course"), f.course)),
       h("label.field", { style: { marginTop: ".7rem" } }, h("span", "Instructions for students"), f.instructions),
       h("div.grid.grid-3", { style: { marginTop: ".7rem" } },
-        h("label.field", h("span", "Opens at"), f.opens_at),
-        h("label.field", h("span", "Closes at (hard cut-off)"), f.closes_at),
+        h("label.field", h("span", "Assessment type"), f.exam_type,
+          h("span.help", "Groups your exams and labels the reports.")),
+        h("label.field", h("span", "Pass mark (%)"), f.passing_percent,
+          h("span.help", "Used by the score-per-section report.")),
         h("label.field", h("span", "Professor name shown"), f.owner_name)),
+      h("div.grid.grid-2", { style: { marginTop: ".7rem" } },
+        h("label.field", h("span", "Opens at"), f.opens_at),
+        h("label.field", h("span", "Closes at (hard cut-off)"), f.closes_at)),
     ),
+    // Co-teachers only make sense once the exam exists and has a code.
+    ex.code
+      ? h("div.card",
+          h("div.card-head", h("div", h("h3", "Teachers"),
+            h("div.small.muted", "Everyone who can monitor and grade this exam")),
+            isOwner
+              ? h("button.btn.btn-sm", { onclick: addTeacherDialog }, "＋ Add a teacher")
+              : h("span.badge", "shared with you")),
+          teacherHost)
+      : null,
     h("div.card",
       h("h3", "How the exam runs"),
       h("p.help", { style: { marginTop: 0 } },
@@ -863,11 +1272,19 @@ async function viewEditor(main, code) {
         h("summary", "Who is allowed in", note.access),
         h("div.group-body",
           f.require_student_id,
-          h("div.grid.grid-2", { style: { marginTop: ".8rem" } },
-            h("label.field", h("span", "Restrict to e-mail domain"), f.allowed_domain,
-              h("span.help", "Blank lets any signed-in account in.")),
-            h("label.field", h("span", "Roster"), f.roster,
-              h("span.help", "One e-mail per line. Blank lets anyone with the code in."))))),
+          h("label.field", { style: { marginTop: ".8rem", maxWidth: "360px" } },
+            h("span", "Restrict to e-mail domain"), f.allowed_domain,
+            h("span.help", "Blank lets any signed-in account in.")),
+          h("div.card-head", { style: { marginTop: "1.1rem", marginBottom: ".5rem" } },
+            h("div", h("strong", "Roster"), h("div", rosterCountEl)),
+            h("div.row",
+              h("button.btn.btn-sm", { type: "button", onclick: addStudentDialog }, "＋ Add a student"),
+              h("button.btn.btn-sm.btn-primary", { type: "button", onclick: bulkAddDialog }, "⬆ Add in bulk"))),
+          rosterHost,
+          h("p.help", { style: { marginTop: ".6rem" } },
+            "A roster does two jobs: only these accounts may start the exam, and their " +
+            "number and section come from here rather than from whatever they type at the gate — " +
+            "which is what makes the score-per-section report trustworthy."))),
 
       h("details.group",
         h("summary", "After the exam", note.after),
@@ -903,10 +1320,24 @@ async function viewEditor(main, code) {
       } }, "⏹ Close exam") : null,
       ex.status === "closed" ? h("button.btn", { onclick: () => save("open") }, "Re-open") : null,
       h("div.spacer"),
-      ex.code ? h("button.btn.btn-sm.btn-danger", { onclick: () => removeExam(ex.code) }, "🗑 Delete exam") : null,
+      ex.code && isOwner
+        ? h("button.btn.btn-sm.btn-danger", { onclick: () => removeExam(ex.code) }, "🗑 Delete exam") : null,
     )),
   ].filter(Boolean));
   render();
+  drawRoster();
+  drawTeachers();
+
+  // The roster and the teacher list are secondary; the form is usable while
+  // they load, and a failure on either must not blank the editor.
+  if (ex.code) {
+    examRoster(ex.code)
+      .then((r) => { roster = r || []; drawRoster(); refreshSummary(); })
+      .catch((e) => rosterHost.append(h("div.form-error", e.friendly || e.message)));
+    examTeachers(ex.code)
+      .then((t) => { teachers = t || []; drawTeachers(); })
+      .catch(() => { /* the owner badge alone is fine */ });
+  }
 }
 
 async function removeExam(code) {
@@ -933,6 +1364,14 @@ async function viewMonitor(main, code) {
   const tbody = h("tbody");
   const search = h("input.input", { placeholder: "Filter by name / e-mail / section…", style: { maxWidth: "300px" }, oninput: () => render() });
   const onlyFlag = h("input", { type: "checkbox", onchange: () => render() });
+  const picked = new Set();                       // session ids ticked for a bulk action
+  const bulkBar = h("div.bulk-bar", { hidden: true });
+  const pickAll = h("input", { type: "checkbox", title: "Select every row shown",
+    onchange: (e) => {
+      for (const s of visible) e.target.checked ? picked.add(s.id) : picked.delete(s.id);
+      render();
+    } });
+  let visible = [];
 
   mount(main,
     h("div.card-head",
@@ -955,8 +1394,10 @@ async function viewMonitor(main, code) {
         h("div.row",
           h("button.btn.btn-sm", { onclick: analyseAll }, "🔍 Analyse risk (loads event logs)"),
           h("button.btn.btn-sm", { onclick: () => exportWorkbook(ex, sessions, grades, risks) }, "⬇ Excel"))),
+      bulkBar,
       h("div.table-wrap", h("table.table",
-        h("thead", h("tr", h("th", "Student"), h("th", "Status"), h("th", "Progress"), h("th", "Time left"),
+        h("thead", h("tr", h("th", { style: { width: "1.6rem" } }, pickAll),
+          h("th", "Student"), h("th", "Status"), h("th", "Progress"), h("th", "Time left"),
           h("th", "Violations"), h("th", "Risk"), h("th", "Score"), h("th", "Actions"))),
         tbody)),
     ),
@@ -1018,6 +1459,7 @@ async function viewMonitor(main, code) {
     clear(tbody);
     list.sort((a, b) => (a.display_name || a.email).localeCompare(b.display_name || b.email));
     let shown = 0;
+    visible = [];
     for (const s of list) {
       const es = effectiveStatus(s, ex), risk = risks.get(s.id), g = grades.get(s.id);
       const flagged = s.flagged || risk?.level === "high" || s.violations >= ex.max_violations;
@@ -1027,7 +1469,11 @@ async function viewMonitor(main, code) {
       const hbAge = Date.now() - (toDate(s.heartbeat_at)?.getTime() || 0);
       const dot = es !== "in_progress" ? "" : hbAge < 60_000 ? "dot-online" : hbAge < 180_000 ? "dot-idle" : "dot-offline";
       const dl = deadlineOf(s, ex);
+      visible.push(s);
       tbody.append(h("tr", { class: `risk-${risk?.level || (flagged ? "high" : "")}` },
+        h("td", { style: { width: "1.6rem" } },
+          h("input", { type: "checkbox", checked: picked.has(s.id), title: "Select",
+            onchange: (e) => { e.target.checked ? picked.add(s.id) : picked.delete(s.id); drawBulk(); } })),
         h("td",
           h("div", dot ? h("span.dot", { class: `dot ${dot}`, title: `heartbeat ${ago(s.heartbeat_at)}` }) : null,
             h("strong", s.display_name || "—"), s.flagged ? " 🚩" : ""),
@@ -1074,10 +1520,70 @@ async function viewMonitor(main, code) {
         )),
       ));
     }
+    drawBulk();
     if (!shown) {
-      tbody.append(h("tr", h("td", { colspan: 8 }, h("div.empty",
+      tbody.append(h("tr", h("td", { colspan: 9 }, h("div.empty",
         list.length ? "No student matches that filter." : ["No students have started yet. Share the code ", h("strong", code), "."]))));
     }
+  }
+
+  /** Shows what is selected and what can be done with it. */
+  function drawBulk() {
+    const n = picked.size;
+    bulkBar.hidden = n === 0;
+    pickAll.checked = visible.length > 0 && visible.every((s) => picked.has(s.id));
+    if (!n) return;
+    clear(bulkBar);
+    bulkBar.append(
+      h("strong", `${n} selected`),
+      h("div.spacer"),
+      h("button.btn.btn-sm", { onclick: () => { picked.clear(); render(); } }, "Clear"),
+      h("button.btn.btn-sm", { title: "Give every selected student the same extra time",
+        onclick: async () => {
+          const m = await promptDialog("Extra time", `Total extra minutes for ${n} student(s)`, "10", "number");
+          if (m == null) return;
+          const mins = Math.max(0, parseInt(m) || 0);
+          let ok = 0;
+          for (const id of picked) {
+            try { await profUpdateSession(id, { extra_minutes: mins }); ok++; } catch {}
+          }
+          toast(`Extra time set for ${ok} student(s).`, "success");
+          picked.clear(); await reload();
+        } }, "+⏱ Extra time"),
+      h("button.btn.btn-sm.btn-danger", { onclick: () => resetPicked() }, "↺ Reset attempts"),
+    );
+  }
+
+  /**
+   * Resetting deletes the attempt, which is what "let them sit it again"
+   * means: their answers, event log and grade go with it.
+   */
+  async function resetPicked() {
+    const ids = [...picked];
+    const names = ids.map((id) => sessions.get(id)?.display_name || sessions.get(id)?.email)
+      .filter(Boolean);
+    const listing = names.slice(0, 6).map((n) => `<li>${esc(n)}</li>`).join("")
+      + (names.length > 6 ? `<li>…and ${names.length - 6} more</li>` : "");
+    if (!await confirmDialog(`Reset ${ids.length} attempt(s)?`,
+      `<p>Each of these students can start the exam again from the beginning. ` +
+      `Their answers, event log and grade are deleted and cannot be recovered.</p>` +
+      `<ul style="margin:.5rem 0 0;padding-left:1.2rem">${listing}</ul>`,
+      "Reset them")) return;
+    try {
+      const n = await resetSessions(code, ids);
+      ids.forEach((id) => { sessions.delete(id); grades.delete(id); risks.delete(id); });
+      picked.clear();
+      toast(`${n} attempt(s) reset.`, "success");
+      render();
+    } catch (e) { toast(e.friendly || e.message, "error", 6000); }
+  }
+
+  async function reload() {
+    try {
+      sessions.clear();
+      (await examSessions(code)).forEach((s) => sessions.set(s.id, s));
+    } catch (e) { toast(e.friendly || e.message, "error"); }
+    render();
   }
 
   async function act(s, patch, msg) {
@@ -1262,6 +1768,7 @@ async function viewGrades(main, code) {
   const risks = new Map();
 
   const body = h("tbody#gradesBody");
+  const sectionHost = h("div");
   const fill = () => {
     clear(body);
     const list = [...sessions.values()].sort((a, b) => (a.display_name || a.email).localeCompare(b.display_name || b.email));
@@ -1321,12 +1828,67 @@ async function viewGrades(main, code) {
       "Grading runs inside the database, so the answer key is never sent to this browser. " +
       "Attempts whose time has expired are graded from their last saved answers. " +
       "Essay questions need manual points — click Review.")),
+    h("div.card",
+      h("div.card-head", h("div", h("h3", "Score by section"),
+        h("div.small.muted", `Pass mark ${Number(ex.passing_percent ?? 60)}%`)),
+        h("button.btn.btn-sm", { onclick: () => loadSections(true) }, "↻ Refresh")),
+      sectionHost),
     h("div.card", h("div.table-wrap", h("table.table",
       h("thead", h("tr", h("th", "Student"), h("th", "Section"), h("th", "Status"), h("th", "Submitted"),
         h("th", "Violations"), h("th", "Score"), h("th", "%"), h("th", ""))),
       body))),
   );
   fill();
+  loadSections();
+
+  // Per-section figures are computed in the database so they cover every
+  // student, not just the rows this page happens to be holding.
+  async function loadSections(again) {
+    clear(sectionHost);
+    sectionHost.append(h("p.muted.small", again ? "Recalculating…" : "Loading…"));
+    let rows;
+    try { rows = await sectionStats(code); }
+    catch (e) {
+      clear(sectionHost);
+      return sectionHost.append(h("div.form-error", e.friendly || e.message));
+    }
+    clear(sectionHost);
+    if (!rows.length) {
+      return sectionHost.append(h("div.empty", "Nobody has sat this exam yet."));
+    }
+    const pass = Number(ex.passing_percent ?? 60);
+    const num = (v, suffix = "") => (v == null ? h("span.muted", "—") : `${v}${suffix}`);
+    const tb = h("tbody");
+    let tStudents = 0, tGraded = 0, tPassed = 0, wsum = 0;
+    for (const r of rows) {
+      tStudents += r.students; tGraded += r.graded; tPassed += r.passed;
+      if (r.avg_percent != null) wsum += Number(r.avg_percent) * r.graded;
+      const rate = r.pass_rate;
+      tb.append(h("tr",
+        h("td", h("strong", r.section)),
+        h("td", r.students),
+        h("td", r.submitted),
+        h("td", r.graded),
+        h("td", num(r.avg_percent, "%")),
+        h("td", num(r.high_percent, "%")),
+        h("td", num(r.low_percent, "%")),
+        h("td", rate == null ? h("span.muted", "—")
+          : h("span", { style: { color: rate >= 70 ? "var(--success)" : rate >= 50 ? "var(--warn)" : "var(--danger)",
+                                 fontWeight: "700" } }, `${rate}%`),
+          h("span.small.muted", rate == null ? "" : ` (${r.passed}/${r.graded})`)),
+        h("td", r.flagged ? h("span.badge.badge-danger", String(r.flagged)) : h("span.muted", "0"))));
+    }
+    const overall = tGraded ? Math.round((wsum / tGraded) * 10) / 10 : null;
+    tb.append(h("tr", { style: { fontWeight: "700", background: "var(--surface-2)" } },
+      h("td", "All sections"), h("td", tStudents), h("td", ""), h("td", tGraded),
+      h("td", num(overall, "%")), h("td", ""), h("td", ""),
+      h("td", tGraded ? `${Math.round((tPassed / tGraded) * 1000) / 10}%` : "—"), h("td", "")));
+
+    sectionHost.append(h("div.table-wrap", h("table.table",
+      h("thead", h("tr", h("th", "Section"), h("th", "Students"), h("th", "Submitted"),
+        h("th", "Graded"), h("th", "Average"), h("th", "Highest"), h("th", "Lowest"),
+        h("th", `Passed (≥${pass}%)`), h("th", "Flagged"))), tb)));
+  }
 }
 
 /**
@@ -1349,7 +1911,9 @@ async function exportWorkbook(ex, sessions, grades, risks) {
       [],
       [{ v: "Exam code", s: XS.BOLD }, ex.code],
       [{ v: "Professor", s: XS.BOLD }, ex.owner_name || ""],
+      [{ v: "Type", s: XS.BOLD }, EXAM_TYPES[ex.exam_type] || ex.exam_type || "Exam"],
       [{ v: "Status", s: XS.BOLD }, ex.status],
+      [{ v: "Pass mark", s: XS.BOLD }, { v: Number(ex.passing_percent ?? 60), s: XS.PERCENT }],
       [{ v: "Duration", s: XS.BOLD }, `${ex.duration_minutes} minutes`],
       [{ v: "Questions", s: XS.BOLD }, ex.question_count ?? ""],
       [{ v: "Total points", s: XS.BOLD }, Number(ex.total_points) || ""],
@@ -1396,6 +1960,30 @@ async function exportWorkbook(ex, sessions, grades, risks) {
 
   const sheets = [summary, students];
 
+  // Score by section — the sheet a programme chair asks for.
+  try {
+    const secs = await sectionStats(ex.code);
+    if (secs.length) {
+      const pass = Number(ex.passing_percent ?? 60);
+      const rows = [["Section", "Students", "Submitted", "Graded", "Average %",
+        "Highest %", "Lowest %", "Average score", `Passed (>=${pass}%)`, "Pass rate %",
+        "Flagged", "Violations"]];
+      for (const r of secs) {
+        rows.push([r.section, r.students, r.submitted, r.graded,
+          r.avg_percent == null ? "" : { v: Number(r.avg_percent), s: XS.PERCENT },
+          r.high_percent == null ? "" : { v: Number(r.high_percent), s: XS.PERCENT },
+          r.low_percent == null ? "" : { v: Number(r.low_percent), s: XS.PERCENT },
+          r.avg_score == null ? "" : Number(r.avg_score),
+          r.passed,
+          r.pass_rate == null ? "" : { v: Number(r.pass_rate),
+            s: r.pass_rate >= 70 ? XS.OK : r.pass_rate >= 50 ? XS.WARN : XS.DANGER },
+          r.flagged || "", Number(r.violations) || 0]);
+      }
+      sheets.push({ name: "By section", filter: true,
+        cols: [18, 10, 11, 9, 11, 11, 11, 14, 15, 12, 9, 11], rows });
+    }
+  } catch { /* the other sheets are still worth having */ }
+
   // Item analysis, when there is something to analyse. Per-question verdicts
   // come back with the grade, so this costs one extra read for the prompts.
   try {
@@ -1427,12 +2015,16 @@ async function exportWorkbook(ex, sessions, grades, risks) {
 
 // ----------------------------------------------------------------- access
 async function viewAccess(main) {
-  main.append(h("div.card-head", h("h1", "Access"), null));
+  const admin = P.profile?.role === "admin";
+  main.append(h("div.card-head", h("h1", "Access"),
+    admin ? h("a.btn.btn-sm", { href: "#admin" }, "🛡 Administration") : null));
   const emailI = h("input.input", { type: "email", placeholder: "colleague@university.edu" });
   const list = h("div");
   main.append(
     h("div.card", h("h3", "Add a professor"),
-      h("p.help", "They must sign in to this site once first — that creates their account. Then enter their e-mail here."),
+      h("p.help", "They must sign in to this site once first — that creates their account. " +
+        (admin ? "As an administrator you can also change anyone's role from the Administration tab."
+               : "You can invite a colleague; only an administrator can change an existing professor's role.")),
       h("form.row", { onsubmit: async (e) => {
         e.preventDefault();
         const em = emailI.value.trim().toLowerCase();
@@ -1440,23 +2032,28 @@ async function viewAccess(main) {
         try { await setRoleByEmail(em, "professor"); toast(`${em} is now a professor.`, "success"); emailI.value = ""; load(); }
         catch (e2) { toast(e2.friendly || e2.message, "error", 6000); }
       } }, h("div", { style: { flex: 1 } }, emailI), h("button.btn.btn-primary", { type: "submit" }, "Add"))),
-    h("div.card", h("h3", "Current professors"), list),
+    h("div.card", h("h3", "Staff on this site"), list),
   );
   async function load() {
     clear(list);
     try {
-      const profs = await listProfessors();
+      const profs = await listStaff();
       if (!profs.length) return list.append(h("p.muted", "None yet."));
       profs.forEach((u) => list.append(h("div.row.between",
         { style: { padding: ".4rem 0", borderBottom: "1px solid var(--border)" } },
-        h("div", h("strong", u.display_name || u.email), h("div.small.muted", u.email)),
-        u.id !== P.user.id
-          ? h("button.btn.btn-sm", { onclick: async () => {
-              if (await confirmDialog("Remove?", `${esc(u.email)} will become a student account.`, "Remove")) {
-                try { await setRoleByEmail(u.email, "student"); load(); }
-                catch (e) { toast(e.friendly || e.message, "error"); }
-              }
-            } }, "Remove") : h("span.badge", "you"))));
+        h("div", h("strong", u.display_name || u.email),
+          u.role === "admin" ? h("span.badge.badge-primary", { style: { marginLeft: ".4rem" } }, "admin") : null,
+          h("div.small.muted", u.email)),
+        u.id === P.user.id
+          ? h("span.badge", "you")
+          : admin
+            ? h("button.btn.btn-sm", { onclick: async () => {
+                if (await confirmDialog("Remove?", `${esc(u.email)} will become a student account.`, "Remove")) {
+                  try { await setRoleByEmail(u.email, "student"); load(); }
+                  catch (e) { toast(e.friendly || e.message, "error"); }
+                }
+              } }, "Remove")
+            : h("span.badge", u.role === "admin" ? "administrator" : "professor"))));
     } catch (e) { list.append(h("div.form-error", e.friendly || e.message)); }
   }
   load();
@@ -1481,7 +2078,34 @@ function viewHelp(main) {
       <li>Submitted, locked and terminated attempts are frozen. Violation counters can only go up. Only you can unlock, extend, terminate or reset.</li>
       <li>Grades are visible to a student only after you release them, and never another student's.</li>
     </ul>
+    <h3>Roles and sharing</h3>
+    <p><strong>Professor</strong> runs their own exams. <strong>Administrator</strong> does that and also sees
+      every exam on the site and sets anyone's role, from the Admin tab. A professor can invite a student to
+      become a professor; only an administrator can change an existing professor's role or create another
+      administrator.</p>
+    <p><strong>Co-teachers:</strong> open an exam and use <strong>Teachers → Add a teacher</strong>. They can
+      monitor, grade, export and edit it. They cannot delete it, hand it to someone else, or add more
+      teachers — that stays with the owner.</p>
+    <h3>The roster, and why sections are worth getting right</h3>
+    <p>Under <strong>Who is allowed in</strong> you can add students one at a time or drop in a class list
+      (Excel, CSV, or four columns pasted in — column order does not matter and headers are optional).
+      A roster does two jobs: only those accounts can start the exam, and their student number and section
+      come from the roster rather than from whatever they type at the gate. That second one is what makes
+      <strong>Score by section</strong> on the Grades tab mean anything — without it half the class writes
+      &ldquo;3-A&rdquo; and the other half &ldquo;BSIT 3A&rdquo;. Re-importing a corrected list updates
+      students instead of duplicating them.</p>
+    <h3>Resetting an attempt</h3>
+    <p>Tick rows on the Live monitor and use <strong>Reset attempts</strong> — the attempt is deleted,
+      answers, event log and grade with it, and the student starts clean. The same bar grants extra time
+      to several students at once.</p>
     <h3>Getting questions in and grades out</h3>
+    <p><strong>From a document you already wrote:</strong> drop in the Word file or PDF. Numbered questions,
+      their options and the answer key are read out of it &mdash; <code>1.</code>, <code>1)</code> or
+      <code>Q1.</code>; options as <code>A.</code> or <code>a)</code>; <code>Answer: B</code> on its own line
+      or in brackets on the prompt; points as <code>(2 pts)</code>; and a <code>TRUE OR FALSE</code> heading
+      makes the items under it true/false. Nothing leaves your browser and nothing is guessed silently:
+      whatever it was unsure about is listed before you commit. A scanned PDF is pictures rather than text,
+      so save it as .docx from Word first.</p>
     <p><strong>In:</strong> download the Excel template from any Import dialog. One row per question —
       <code>Type</code> (mc, multi, tf, text, essay), <code>Points</code>, <code>Question</code>,
       <code>Option A</code>…, and <code>Correct</code>. Correct is a letter for multiple choice

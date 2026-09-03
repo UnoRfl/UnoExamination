@@ -9,7 +9,7 @@ plan, nothing to maintain.
 
 |                     | Professors                                                        | Students                                                   |
 |---------------------|-------------------------------------------------------------------|------------------------------------------------------------|
-| Build exams         | multiple choice, multi-select, true/false, short answer, essay; import a whole paper from one Excel, CSV or JSON file | sign in with Google or e-mail, enter a 6-character code |
+| Build exams         | multiple choice, multi-select, true/false, short answer, essay; generate a whole paper from a Word/PDF document, or import Excel, CSV or JSON | sign in with Google or e-mail, enter a 6-character code |
 | Anti-cheat          | fullscreen, tab/window/blur, copy-paste, devtools, reload, second-tab, offline detection; configurable strike limit → warn / lock / auto-submit | clear rules page, live strike counter, autosave, resume after crash |
 | Live monitor        | who is online, progress, time left, violations, risk score; unlock, add time, force-submit, terminate, reset | server-side timer — closing the page does not pause it |
 | Grading             | auto-graded **inside the database**, so the answer key never reaches any browser; manual points for essays; release scores; Excel export | see score & feedback once released |
@@ -76,6 +76,51 @@ The live deployment is already configured. To stand up your own copy:
    workbook with a summary sheet, one row per student, and an item analysis
    showing which questions the class found hard).
 
+### Roles
+
+| Role | Can |
+|---|---|
+| **Student** | Sit an exam they have the code for, and see their own score once released. |
+| **Professor** | Create and run their own exams; be added as a co-teacher on someone else's; invite a colleague to become a professor. |
+| **Administrator** | Everything a professor can, plus: see every exam on the site, and set anyone's role — including making another administrator. Gets an extra **Admin** tab. |
+
+A professor can invite a *student* to become a professor and nothing more —
+they cannot demote a colleague or create an administrator. Every role change
+is checked in the database, not just in the page.
+
+**Co-teachers.** Open an exam → **Teachers** → *Add a teacher*. They can monitor,
+grade, export and edit it. They cannot delete it, hand it to someone else, or
+add further teachers — that stays with the owner (or an administrator).
+
+### The roster: who may sit the exam
+
+Editor → **Who is allowed in** → **Roster**. Add students one at a time, or drop
+in a class list (Excel, CSV, or four columns pasted in). Column order does not
+matter and headers are optional — the e-mail column is found either way.
+
+A roster does two jobs:
+
+1. Only those accounts can start the exam.
+2. Their **student number and section come from the roster**, not from whatever
+   they type at the gate. That is what makes the score-per-section report
+   trustworthy — otherwise half the class writes `3-A`, the other half `BSIT 3A`,
+   and the report is nonsense.
+
+Re-importing a corrected list updates students rather than duplicating them.
+
+### Score by section
+
+The **Grades** tab shows every section's headcount, average, highest, lowest,
+pass rate against the exam's pass mark, and flag count — computed in the
+database, so it covers every student rather than the rows on screen. It is also
+a sheet in the Excel export.
+
+### Resetting attempts
+
+Tick the rows on the **Live monitor** and use *Reset attempts*. Resetting deletes
+the attempt — answers, event log and grade — so the student starts clean. The
+same bar sets extra time for several students at once.
+
 ### Exam settings explained
 
 | Setting | Effect |
@@ -137,7 +182,45 @@ Three ways in, all from the same button. **My exams → Import an exam** turns a
 file into a complete draft; **Import a file** inside an editor adds to or
 replaces the paper you are working on.
 
-### 1. An Excel or CSV question sheet (easiest)
+### 1. A document you already wrote (Word, PDF, text)
+
+Drop in the paper itself. The importer reads the numbered questions, their
+options and the answer key straight out of it:
+
+```
+PART I. MULTIPLE CHOICE
+
+1. Which control limits the damage of a stolen password?
+A. Password rotation
+B. Multi-factor authentication
+C. Longer passwords
+Answer: B
+
+PART II. TRUE OR FALSE
+
+2. Encryption at rest protects a stolen disk. [Answer: True]
+
+3. Name the principle of least access. (2 pts)
+Answer: least privilege | POLP
+```
+
+It copes with `1.`, `1)` and `Q1.`; options as `A.`, `a)` or `(A)`; answers on
+their own line or in brackets on the prompt; `Answer:`, `Ans:` or `Key:`;
+points written as `(2 pts)`; prompts that wrap; and `PART …` headings between
+sections — a `TRUE OR FALSE` heading makes the items under it true/false. An
+answer can be a letter, a number, several letters (`A and C`), or the option's
+own words.
+
+Formats: **.docx**, **.pdf**, **.txt**, **.md**, **.html**, or pasted straight in.
+A scanned PDF holds pictures rather than text, so it cannot be read — save it as
+.docx from Word first. Old `.doc` is not supported.
+
+This is a parser, not a model: nothing leaves your browser, there is no API key,
+and the same file always gives the same result. Anything it had to guess is
+listed before you commit, and unfinished questions are flagged amber in the
+editor.
+
+### 2. An Excel or CSV question sheet
 
 Download the template from either import dialog — it ships with one worked
 example of every question type and a sheet explaining each column. One row per
@@ -167,7 +250,7 @@ commit — it never guesses silently.
 **Export → Excel** writes this exact format back out, so you can edit a live
 exam in Excel and import it again.
 
-### 2. A JSON bundle (exact round-trip)
+### 3. A JSON bundle (exact round-trip)
 
 **Export → JSON** produces this, and it is the format to hand-write if you
 prefer. The answer key sits on the question:
@@ -195,7 +278,7 @@ Two ready-made samples live in [`examples/`](examples/):
 [`sample-questions.csv`](examples/sample-questions.csv) — the same five-question
 paper in both formats. Both are checked by the test suite, so they always import.
 
-### 3. The older shapes
+### 4. The older shapes
 
 The split `{questions, answers}` export from earlier versions and the legacy
 `baseQuizData = [{ "type": "text", "q": "…", "a": ["…"] }]` array both still

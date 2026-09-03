@@ -256,7 +256,7 @@ async function inflateRaw(bytes) {
 }
 
 /** Reads a ZIP into `{ name: Uint8Array }`, via its central directory. */
-async function unzip(buf) {
+export async function unzip(buf) {
   const b = new Uint8Array(buf), dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   let eocd = -1;
   for (let i = b.length - 22; i >= 0 && i > b.length - 66000; i--) {
@@ -288,6 +288,12 @@ async function unzip(buf) {
 }
 
 const decode = (u8) => new TextDecoder().decode(u8);
+
+/**
+ * A .docx is a ZIP too, so the same reader serves the document importer.
+ * Named for what it is used for rather than exporting `unzip` twice.
+ */
+export const readZipText = unzip;
 
 /** Column letters back to a 0-based index. */
 function colIndex(ref) {

@@ -16,9 +16,21 @@ import { QUESTION_TYPES, validateQuestion, validateKey } from "./paper.js";
 import { importQuestions } from "./grading.js";
 import { S } from "./xlsx.js";
 
+/** The kinds of assessment an exam can be. Matches the database constraint. */
+export const EXAM_TYPES = {
+  quiz: "Quiz",
+  long_test: "Long test",
+  prelim: "Prelim examination",
+  midterm: "Midterm examination",
+  semi_final: "Semi-final examination",
+  final: "Final examination",
+  practice: "Practice / review",
+  other: "Other",
+};
+
 /** Settings a bundle may carry. Anything else in the file is ignored. */
 export const BUNDLE_SETTINGS = {
-  title: "", course: "", instructions: "",
+  title: "", course: "", instructions: "", exam_type: "quiz", passing_percent: 60,
   duration_minutes: 60, max_violations: 5, violation_action: "lock",
   require_fullscreen: true, block_clipboard: true,
   shuffle_questions: true, shuffle_options: true, one_at_a_time: false,
@@ -27,7 +39,7 @@ export const BUNDLE_SETTINGS = {
 };
 
 const BOOLS = new Set(Object.keys(BUNDLE_SETTINGS).filter((k) => typeof BUNDLE_SETTINGS[k] === "boolean"));
-const NUMS = new Set(["duration_minutes", "max_violations", "questions_per_student"]);
+const NUMS = new Set(["duration_minutes", "max_violations", "questions_per_student", "passing_percent"]);
 
 const truthy = (v) => {
   if (typeof v === "boolean") return v;
@@ -117,6 +129,8 @@ export function toQuestionSheet(exam, questions) {
 
 const SETTING_NOTES = {
   title: "Shown to students. Required.",
+  exam_type: "quiz, long_test, prelim, midterm, semi_final, final, practice or other.",
+  passing_percent: "The pass mark, used by the score-per-section report.",
   course: "Optional subject line.",
   instructions: "Shown before the exam starts.",
   duration_minutes: "Counted from each student's own start.",
@@ -297,7 +311,10 @@ export function settingsFromTable(rows) {
     if (!(k in BUNDLE_SETTINGS) || row[1] === undefined || row[1] === "") continue;
     const v = row[1];
     if (BOOLS.has(k)) out[k] = truthy(v);
-    else if (NUMS.has(k)) { const n = Number(v); if (Number.isFinite(n)) out[k] = n; }
+    else if (k === "exam_type") {
+      const t = String(v).trim().toLowerCase().replace(/[\s-]+/g, "_");
+      if (t in EXAM_TYPES) out[k] = t;
+    } else if (NUMS.has(k)) { const n = Number(v); if (Number.isFinite(n)) out[k] = n; }
     else if (k === "roster") out[k] = String(v).split(/[\n,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
     else out[k] = String(v);
   }
@@ -358,7 +375,10 @@ function parseJsonish(text) {
       else if (NUMS.has(k)) exam[k] = Number(src[k]) || BUNDLE_SETTINGS[k];
       else if (k === "roster") exam[k] = (Array.isArray(src[k]) ? src[k] : String(src[k]).split(/[\n,;]+/))
         .map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-      else exam[k] = String(src[k]);
+      else if (k === "exam_type") {
+        const t = String(src[k]).trim().toLowerCase().replace(/[\s-]+/g, "_");
+        if (t in EXAM_TYPES) exam[k] = t;
+      } else exam[k] = String(src[k]);
     }
     // A bare title at the top level is the common hand-written case.
     if (!exam.title && typeof data.title === "string") exam.title = data.title;
@@ -373,4 +393,69 @@ export function bundleProblems(questions) {
   const errs = [];
   questions.forEach((q, i) => errs.push(...validateQuestion(q, i), ...validateKey(q, q.key, i)));
   return errs;
+}
+
+// ------------------------------------------------------------------ roster
+/**
+ * Reads a class list out of a sheet. Headers are honoured when present, and
+ * guessed from the content when they are not — a registrar export rarely calls
+ * its columns what we would.
+ */
+export function rosterFromTable(rows) {
+  const table = (rows || []).filter((r) => r.some((c) => String(c ?? "").trim() !== ""));
+  if (!table.length) throw new Error("That sheet is empty.");
+
+  const head = table[0].map((c) => String(c ?? "").trim().toLowerCase());
+  const looksLikeHeader = head.some((h) => /mail|name|number|no\.?$|section|id/.test(h))
+    && !head.some((h) => h.includes("@"));
+  const find = (...names) => head.findIndex((h) => names.some((n) => h === n || h.includes(n)));
+
+  let col = { email: -1, display_name: -1, student_no: -1, section: -1 };
+  if (looksLikeHeader) {
+    col = {
+      email: find("email", "e-mail", "mail"),
+      display_name: find("name", "student name", "full name"),
+      student_no: find("student no", "student number", "student id", "id no", "number"),
+      section: find("section", "class", "block"),
+    };
+    // "Student name" would otherwise win the e-mail search on "mail"; make sure
+    // the two never point at the same column.
+    if (col.display_name === col.email) col.display_name = -1;
+  }
+  const body = looksLikeHeader ? table.slice(1) : table;
+
+  // No usable header: find the column that actually holds addresses.
+  if (col.email < 0) {
+    const width = Math.max(...body.map((r) => r.length));
+    for (let i = 0; i < width; i++) {
+      if (body.some((r) => String(r[i] ?? "").includes("@"))) { col.email = i; break; }
+    }
+  }
+  if (col.email < 0) throw new Error("No column of e-mail addresses was found.");
+
+  const out = [];
+  for (const r of body) {
+    const cell = (i) => (i >= 0 ? String(r[i] ?? "").trim() : "");
+    const email = cell(col.email).toLowerCase();
+    if (!email.includes("@")) continue;
+    // Without headers, take the remaining columns in the order people write them.
+    const rest = looksLikeHeader ? [] : r
+      .map((c, i) => (i === col.email ? null : String(c ?? "").trim()))
+      .filter((c) => c !== null && c !== "");
+    out.push({
+      email,
+      display_name: cell(col.display_name) || rest[0] || "",
+      student_no: cell(col.student_no) || rest[1] || "",
+      section: cell(col.section) || rest[2] || "",
+    });
+  }
+  return out;
+}
+
+/** The same, from text pasted into a box: one student per line. */
+export function rosterFromText(text) {
+  const rows = String(text || "").split(/\r?\n/)
+    .map((l) => l.trim()).filter(Boolean)
+    .map((l) => l.split(/\s*[,;\t|]\s*/));
+  return rosterFromTable(rows);
 }

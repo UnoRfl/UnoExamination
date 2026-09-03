@@ -30,13 +30,70 @@ export const claimProfessor = (secret) =>
 export const setRoleByEmail = (email, role) =>
   sb.rpc("set_role_by_email", { p_email: email, p_role: role }).then(unwrap);
 
-export const listProfessors = () =>
-  sb.from("profiles").select("id,email,display_name,role").eq("role", "professor")
-    .order("email").then(unwrap);
+/** Everyone who can run an exam — professors and administrators. */
+export const listStaff = () =>
+  sb.from("profiles").select("id,email,display_name,role,created_at")
+    .in("role", ["professor", "admin"]).order("email").then(unwrap);
+
+export const findProfiles = (query, limit = 25) => {
+  const q = String(query || "").trim();
+  let sel = sb.from("profiles").select("id,email,display_name,role,student_id,section");
+  if (q) sel = sel.or(`email.ilike.%${q}%,display_name.ilike.%${q}%,student_id.ilike.%${q}%`);
+  return sel.order("email").limit(limit).then(unwrap);
+};
+
+// --------------------------------------------------------------- super admin
+export const staffOverview = () => sb.rpc("staff_overview").then(unwrap);
+export const adminStats = () => sb.rpc("admin_stats").then(unwrap);
+
+/** Every exam in the installation. Administrators only — RLS enforces it. */
+export const allExams = () =>
+  sb.from("exams").select("*").order("updated_at", { ascending: false }).then(unwrap);
 
 // -------------------------------------------------------------------- exams
-export const myExams = () =>
-  sb.from("exams").select("*").order("updated_at", { ascending: false }).then(unwrap);
+/**
+ * The exams this account is responsible for: the ones it owns plus the ones it
+ * co-teaches. RLS lets an administrator read every exam, so they are filtered
+ * out here — an admin sees the whole installation on the Admin tab instead.
+ */
+export async function myExams() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return [];
+  const [exams, shared] = await Promise.all([
+    sb.from("exams").select("*").order("updated_at", { ascending: false }).then(unwrap),
+    sb.from("exam_teachers").select("exam_code").eq("teacher_id", user.id).then(unwrap),
+  ]);
+  const co = new Set((shared || []).map((r) => r.exam_code));
+  return (exams || [])
+    .filter((e) => e.owner_id === user.id || co.has(e.code))
+    .map((e) => ({ ...e, shared: e.owner_id !== user.id }));
+}
+
+// ------------------------------------------------------------- co-teachers
+export const examTeachers = (code) =>
+  sb.rpc("exam_teachers_list", { p_code: code }).then(unwrap);
+
+export const addTeacher = (code, email) =>
+  sb.rpc("teacher_add", { p_code: code, p_email: email }).then(unwrap);
+
+export const removeTeacher = (code, teacherId) =>
+  sb.rpc("teacher_remove", { p_code: code, p_teacher: teacherId }).then(unwrap);
+
+// ----------------------------------------------------------------- roster
+export const examRoster = (code) =>
+  sb.from("exam_roster").select("*").eq("exam_code", code)
+    .order("section").order("display_name").then(unwrap);
+
+/** rows: [{email, display_name, student_no, section}] — upsert, so re-import is safe. */
+export const rosterUpsert = (code, rows) =>
+  sb.rpc("roster_upsert", { p_code: code, p_rows: rows }).then(unwrap);
+
+export const rosterRemove = (code, emails) =>
+  sb.rpc("roster_remove", { p_code: code, p_emails: emails }).then(unwrap);
+
+// -------------------------------------------------------- scores by section
+export const sectionStats = (code) =>
+  sb.rpc("exam_section_stats", { p_code: code }).then(unwrap);
 
 export const getExam = (code) =>
   sb.from("exams").select("*").eq("code", code).maybeSingle().then(unwrap);
@@ -131,6 +188,10 @@ export const profUpdateSession = (id, patch) =>
 
 export const resetSession = (id) =>
   sb.from("sessions").delete().eq("id", id).then(unwrap);
+
+/** Clears several attempts at once. Pass null for ids to reset the whole exam. */
+export const resetSessions = (code, ids) =>
+  sb.rpc("reset_sessions", { p_code: code, p_ids: ids ?? null }).then(unwrap);
 
 // ------------------------------------------------------------------- events
 export const logEvent = (sessionId, type, detail, question) =>

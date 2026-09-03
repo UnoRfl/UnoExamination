@@ -233,7 +233,9 @@ try {
     session: fakeSession(),
     storageKey: `sb-${ref}-auth-token`,
     rest: { profiles: [{ id: FAKE_USER.id, email: FAKE_USER.email, role: "professor",
-                         display_name: "Prof Test", student_id: null, section: null }] },
+                         display_name: "Prof Test", student_id: null, section: null }],
+            exam_teachers: [], exam_roster: [] },
+    rpc: { exam_teachers_list: [], exam_section_stats: [] },
   });
   const ed = editor.page;
   check("editor: offers the rule presets",
@@ -250,7 +252,7 @@ try {
   check("editor: a preset marks itself as selected",
     (await ed.locator('.preset[aria-pressed="true"]').count()) >= 0);
   check("editor: empty question list explains itself",
-    (await ed.locator(".q-empty").innerText()).toLowerCase().includes("no questions"));
+    (await ed.locator("#qHost .q-empty").innerText()).toLowerCase().includes("no questions"));
 
   // add a question, then confirm it collapses to a single row
   await ed.getByRole("button", { name: "+ Multiple choice" }).click();
@@ -336,6 +338,72 @@ try {
   await ed.locator(".q-toolbar input").fill("");
   check("editor: clearing the search restores every question",
     (await ed.locator(".q-row").count()) === 5);
+
+  // --- the new editor panels: assessment type, roster, co-teachers
+  check("editor: the assessment type can be chosen",
+    (await ed.locator("select").filter({ hasText: "Prelim examination" }).count()) === 1);
+  check("editor: there is a pass mark for the section report",
+    (await ed.locator("input[type=number]").count()) >= 3);
+  // the roster lives inside the collapsed "Who is allowed in" group
+  const whoGroup = ed.locator("details.group").filter({ hasText: "Who is allowed in" });
+  await whoGroup.locator("summary").click();
+  check("editor: an empty roster explains what a roster is for",
+    (await whoGroup.locator(".empty").innerText()).toLowerCase().includes("roster"));
+  check("editor: a roster can be built by hand or in bulk",
+    (await ed.getByRole("button", { name: "＋ Add a student" }).count()) === 1 &&
+    (await ed.getByRole("button", { name: "⬆ Add in bulk" }).count()) === 1);
+  check("editor: a brand-new exam has no teacher panel yet",
+    (await ed.locator("body").innerText()).includes("Teachers") === false,
+    "co-teachers need a saved exam first");
+
+  // A class list pasted in any shape must land on the roster.
+  await ed.getByRole("button", { name: "⬆ Add in bulk" }).click();
+  await ed.locator(".modal-card details.group summary").click();     // "…or paste the list"
+  await ed.locator(".modal-card textarea").fill(
+    "juan@school.edu, Dela Cruz Juan, 21-0001, BSIT 3A\n" +
+    "maria@school.edu, Reyes Maria, 21-0002, BSIT 3A\n" +
+    "paolo@school.edu, Santos Paolo, 21-0003, BSIT 3B");
+  await ed.locator(".modal-card .import-status.ok").waitFor({ timeout: 8000 });
+  check("roster: the paste is read before anything is committed",
+    /3 students/.test(await ed.locator(".modal-card .import-status").innerText()),
+    await ed.locator(".modal-card .import-status").innerText());
+  await ed.getByRole("button", { name: "Add to roster" }).click();
+  await ed.locator(".modal-overlay").waitFor({ state: "detached" });
+  check("roster: every student lands in the table",
+    (await whoGroup.locator("table.table tbody tr").count()) === 3,
+    `${await whoGroup.locator("table.table tbody tr").count()} rows`);
+  check("roster: with their number and section",
+    (await whoGroup.locator("table.table").innerText()).includes("21-0002") &&
+    (await whoGroup.locator("table.table").innerText()).includes("BSIT 3B"));
+  check("roster: the settings summary counts the sections",
+    /2 section/.test(await whoGroup.locator("summary").innerText()),
+    await whoGroup.locator("summary").innerText());
+
+  // --- generating an exam from a document the professor already wrote
+  fs.writeFileSync(path.join(OUT, "paper.txt"),
+    "PART I. MULTIPLE CHOICE\n\n" +
+    "1. Which control limits the damage of a stolen password?\n" +
+    "A. Rotation\nB. Multi-factor authentication\nC. Longer passwords\nAnswer: B\n\n" +
+    "PART II. TRUE OR FALSE\n\n" +
+    "2. Encryption at rest protects a stolen disk.\nAnswer: True\n\n" +
+    "PART III. IDENTIFICATION\n\n" +
+    "3. Name the principle of least access. (2 pts)\nAnswer: least privilege | POLP\n");
+  await ed.getByRole("button", { name: "⬆ Import a file" }).click();
+  await ed.locator(".dropzone input[type=file]").setInputFiles(path.join(OUT, "paper.txt"));
+  await ed.locator(".import-status.ok").waitFor({ timeout: 8000 });
+  const docReport = await ed.locator(".import-status").innerText();
+  check("document import: reads a plain exam paper", /3 questions/.test(docReport), docReport.replace(/\n/g, " | "));
+  check("document import: says it read it as a document", /as a document/.test(docReport));
+  await ed.locator(".modal-card select").selectOption("replace");
+  await ed.getByRole("button", { name: "Import", exact: true }).click();
+  await ed.locator(".modal-overlay").waitFor({ state: "detached" });
+  check("document import: the questions and their types come through",
+    (await ed.locator(".type-chip").allInnerTexts()).join(",") === "CHOICE,T / F,SHORT",
+    (await ed.locator(".type-chip").allInnerTexts()).join(","));
+  check("document import: nothing is left needing an answer key",
+    (await ed.locator(".q-flag.warn").count()) === 0);
+  check("document import: points written in the paper are kept",
+    (await ed.locator(".q-row").last().innerText()).includes("2 pt"));
   await editor.ctx.close();
 
   // --- the live monitor, with a class in it. Every row state at once, so the
@@ -345,9 +413,10 @@ try {
     rest: {
       profiles: [{ id: FAKE_USER.id, email: FAKE_USER.email, role: "professor", display_name: "Prof Uno" }],
       exams: [{ ...EXAM, owner_id: FAKE_USER.id, owner_name: "Prof Uno" }],
-      sessions: CLASS, grades: CLASS_GRADES,
+      sessions: CLASS, grades: CLASS_GRADES, exam_teachers: [], exam_roster: [],
     },
-    rpc: { exam_intro: EXAM, server_now: new Date().toISOString() },
+    rpc: { exam_intro: EXAM, server_now: new Date().toISOString(),
+           exam_teachers_list: [], exam_section_stats: [] },
   });
   const mp = mon.page;
   await mp.locator(".table tbody tr").first().waitFor({ timeout: 10000 });

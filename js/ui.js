@@ -126,12 +126,21 @@ export function fmtTime(ts) {
   const d = toDate(ts);
   return d ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
 }
+/**
+ * Anything the app might hold as a moment, as a Date.
+ *
+ * Postgres sends timestamptz as an ISO STRING, and this used to return null for
+ * one — a leftover from Firestore, where timestamps were objects with .toDate().
+ * The effect was quiet and wide: every date read "—", the monitor showed no time
+ * left, and opening an exam for editing reset its open/close window to now,
+ * because toLocalInput() fell back to the current time.
+ */
 export function toDate(ts) {
   if (!ts) return null;
-  if (ts instanceof Date) return ts;
-  if (typeof ts.toDate === "function") return ts.toDate();
-  if (typeof ts === "number") return new Date(ts);
-  return null;
+  if (ts instanceof Date) return Number.isNaN(ts.getTime()) ? null : ts;
+  if (typeof ts.toDate === "function") return ts.toDate();   // legacy Firestore value
+  const d = new Date(ts);                                    // ISO string, or epoch ms
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 export function ago(ts) {
   const d = toDate(ts); if (!d) return "—";

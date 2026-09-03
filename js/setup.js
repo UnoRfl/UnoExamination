@@ -142,7 +142,7 @@ async function run() {
     warn("No profile row yet",
       "It is created by a trigger the first time you sign up.",
       "Sign out and back in once. If it still does not appear, re-apply the migrations.");
-  } else if (profile.role === "professor") {
+  } else if (["professor", "admin"].includes(profile.role)) {
     ok("You are a professor", "You can create exams, monitor them and grade.");
   } else {
     pending = true;
@@ -159,7 +159,7 @@ async function run() {
   }
 
   // ------------------------------------------- 6. can I really run an exam?
-  if (profile?.role === "professor") {
+  if (["professor", "admin"].includes(profile?.role)) {
     const wRow = row(BUSY, "Testing that you can create an exam and read its key back…");
     const code = "SETUP" + Math.floor(Math.random() * 10);
     let wErr = null;

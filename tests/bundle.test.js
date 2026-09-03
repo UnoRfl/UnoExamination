@@ -4,8 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  toBundle, toQuestionSheet, templateSheets,
+  toBundle, toQuestionSheet, templateSheets, EXAM_TYPES,
   questionsFromTable, settingsFromTable, fromBundleJson, bundleProblems,
+  rosterFromTable, rosterFromText,
 } from "../js/bundle.js";
 import { buildXlsx, readXlsx, readDelimited } from "../js/xlsx.js";
 import fs from "node:fs";
@@ -277,4 +278,97 @@ test("no example file carries anything but its own sample key", () => {
   for (const f of fs.readdirSync(EX)) {
     assert.match(f, /^sample-/, `${f} is not a sample — real answer keys must not be committed`);
   }
+});
+
+// ------------------------------------------------------------- class lists
+// A registrar export never calls its columns what we would, and half the time
+// a professor just pastes four comma-separated fields. Both have to work.
+test("a class list with proper headers is read by name", () => {
+  const rows = rosterFromTable([
+    ["Student Name", "Email Address", "Student Number", "Section", "Remarks"],
+    ["Dela Cruz, Juan", "juan@school.edu", "21-0001", "BSIT 3A", "regular"],
+    ["Reyes, Maria", "maria@school.edu", "21-0002", "BSIT 3A", ""],
+  ]);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], { email: "juan@school.edu", display_name: "Dela Cruz, Juan",
+    student_no: "21-0001", section: "BSIT 3A" });
+  assert.equal(rows[1].section, "BSIT 3A");
+});
+
+test('"Student Name" is not mistaken for the e-mail column', () => {
+  // Both headers contain "mail"/"name"; the address column must still win.
+  const rows = rosterFromTable([
+    ["Student Name", "E-mail"],
+    ["Dela Cruz, Juan", "juan@school.edu"],
+  ]);
+  assert.equal(rows[0].email, "juan@school.edu");
+  assert.equal(rows[0].display_name, "Dela Cruz, Juan");
+});
+
+test("a headerless list finds the e-mail column wherever it is", () => {
+  const rows = rosterFromTable([
+    ["21-0001", "Dela Cruz, Juan", "juan@school.edu", "BSIT 3A"],
+    ["21-0002", "Reyes, Maria", "maria@school.edu", "BSIT 3A"],
+  ]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].email, "juan@school.edu");
+  assert.ok(rows[0].display_name && rows[0].section, JSON.stringify(rows[0]));
+});
+
+test("a pasted list, one student per line", () => {
+  const rows = rosterFromText(
+    "juan@school.edu, Dela Cruz Juan, 21-0001, BSIT 3A\n" +
+    "maria@school.edu\t Reyes Maria \t21-0002\tBSIT 3B\n" +
+    "\n" +
+    "paolo@school.edu");
+  assert.equal(rows.length, 3, "the blank line is skipped");
+  assert.equal(rows[0].section, "BSIT 3A");
+  assert.equal(rows[1].display_name, "Reyes Maria", "tabs work too, and spaces are trimmed");
+  assert.deepEqual(rows[2], { email: "paolo@school.edu", display_name: "", student_no: "", section: "" },
+    "an e-mail on its own is enough");
+});
+
+test("rows without an address are skipped, not imported blank", () => {
+  const rows = rosterFromTable([
+    ["Email", "Name"],
+    ["juan@school.edu", "Juan"],
+    ["", "A student who has not signed up"],
+    ["not-an-email", "Typo"],
+  ]);
+  assert.equal(rows.length, 1);
+});
+
+test("a sheet with no addresses at all says so", () => {
+  assert.throws(() => rosterFromTable([["Name", "Section"], ["Juan", "3A"]]),
+    /No column of e-mail addresses/);
+  assert.throws(() => rosterFromTable([]), /empty/i);
+});
+
+// ------------------------------------------------------------- exam type
+test("an exam type survives the bundle round-trip", () => {
+  const b = toBundle({ ...EXAM, exam_type: "midterm", passing_percent: 75 }, PAPER);
+  const back = fromBundleJson(JSON.stringify(b));
+  assert.equal(back.exam.exam_type, "midterm");
+  assert.equal(back.exam.passing_percent, 75);
+});
+
+test("a type written loosely is normalised, and nonsense is dropped", () => {
+  const ok = fromBundleJson(JSON.stringify({
+    exam: { exam_type: "Semi Final" }, questions: [{ type: "tf", prompt: "x", correct: true }] }));
+  assert.equal(ok.exam.exam_type, "semi_final");
+
+  const bad = fromBundleJson(JSON.stringify({
+    exam: { exam_type: "pop quiz surprise" }, questions: [{ type: "tf", prompt: "x", correct: true }] }));
+  assert.ok(!("exam_type" in bad.exam), "an unknown type is left alone rather than breaking the insert");
+});
+
+test("the Settings sheet carries the type and pass mark", () => {
+  const s = settingsFromTable([
+    ["Setting", "Value"],
+    ["exam_type", "FINAL"],
+    ["passing_percent", "75"],
+  ]);
+  assert.equal(s.exam_type, "final");
+  assert.equal(s.passing_percent, 75);
+  assert.ok(Object.keys(EXAM_TYPES).includes(s.exam_type));
 });
