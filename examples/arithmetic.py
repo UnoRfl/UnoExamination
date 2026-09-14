@@ -25,6 +25,6 @@ else:
 
     print("\nMultiplication Table")
     if x == y:
-        print(f"{x} and {y} are the same number")
-    for i in range(1, larger + 1):
-        print(f"{i} x {smaller} = {i * smaller}")
+        print("Both values are equal")
+    for i in range(1, smaller + 1):
+        print(f"{i} x {larger} = {i * larger}")
